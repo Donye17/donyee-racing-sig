@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Donyee [4498891] — Torn City Live Racing Telemetry & Map Signature Server (v2.1)
+Donyee [4498891] — Torn City Live Racing Telemetry & Map Signature Server (v2.2)
 ================================================================================
 Updates:
-  - Added full HEAD request support (`do_HEAD`) so Torn's media proxy and Render
-    health checks return HTTP 200 instead of 501 Not Implemented.
-  - Added root `/` and `/healthz` HTTP 200 handlers for Render.
-  - Independent API error handling: personalstats (v1) and races (v2) are fetched
-    independently so your real Racing Skill, Points, Class, and Podiums ALWAYS
-    render even if you are not currently in a race or if v2 API permissions vary.
-  - Verbose Render console logging for instant visibility into Torn API responses.
+  - Fixed Race Selection: Requests `v2/user/races?sort=DESC&limit=10` and prioritizes
+    any race that is currently active, open, waiting, or staging over finished ones.
+  - Live Staging Detection: Accurately detects when you are waiting for a race to
+    start, displaying `GRID STAGING • STARTS IN X MIN`, plotting cars at the start
+    grid on the track map, and listing all registered drivers.
+  - Reduced API Cache to 20 seconds for fast real-time updates without rate limits.
+  - Full HEAD request & Render health-check support.
 """
 
 import argparse
@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 USER_ID = 4498891
 USER_NAME = "DONYEE"
-CACHE_TTL_SECONDS = 60
+CACHE_TTL_SECONDS = 20
 LIVE_PUSH_TTL_SECONDS = 90
 
 # Official Torn City Raceway Track Metadata (16 Tracks)
@@ -212,7 +212,7 @@ def fetch_json(url: str, api_key: str) -> dict:
         url,
         headers={
             "Authorization": f"ApiKey {api_key}",
-            "User-Agent": "DonyeeRacingTelemetrySig/2.1",
+            "User-Agent": "DonyeeRacingTelemetrySig/2.2",
         },
     )
     with urllib.request.urlopen(req, timeout=8) as resp:
@@ -220,11 +220,6 @@ def fetch_json(url: str, api_key: str) -> dict:
 
 
 def fetch_live_torn_telemetry(api_key: str) -> dict:
-    """
-    Robust Torn API Poller:
-      - Fetches personalstats independently (guaranteed to populate RS, Points, Class, Wins).
-      - Fetches v2/user/races independently (if active, populates track & standings; if none, shows PIT).
-    """
     data = get_demo_telemetry()
     now_ts = int(time.time())
 
@@ -243,29 +238,68 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
             data["races_won"] = int(pstats.get("raceswon", data["races_won"]))
             if data["races_entered"] > 0:
                 data["win_rate"] = (data["races_won"] / data["races_entered"] * 100.0)
+
+            # Check profile icons for racing status indicator
+            icons = v1_data.get("icons", {})
+            if "icon17" in icons:
+                data["race"]["status"] = f"LIVE ON TRACK ({icons['icon17']})"
             print(f"[TORN API v1 OK] RS: {data['racing_skill']} | Pts: {data['racing_points']} | Class: {data['racing_class']}", flush=True)
     except Exception as exc:
         print(f"[TORN API v1 EXCEPTION] {exc}", file=sys.stderr, flush=True)
 
-    # 2. Fetch latest user races (v2)
+    # 2. Fetch latest user races (v2) with sort=DESC and limit=10 to find active/staging race
     try:
-        v2_races_url = f"https://api.torn.com/v2/user/races?limit=1&key={api_key}"
+        v2_races_url = f"https://api.torn.com/v2/user/races?sort=DESC&limit=10&key={api_key}"
         v2_races = fetch_json(v2_races_url, api_key)
         if "error" in v2_races:
             print(f"[TORN API v2 ERROR] {v2_races['error']}", file=sys.stderr, flush=True)
         else:
             races_list = v2_races.get("races", [])
-            if races_list:
-                latest = races_list[0]
-                track_id = int(latest.get("track_id", 5))
+            selected_race = None
+
+            # Prioritize any race currently active, waiting, or scheduled
+            for r in races_list:
+                s_raw = str(r.get("status", "")).lower()
+                s_sched = r.get("schedule", {})
+                s_start = int(s_sched.get("start", 0))
+                s_end = int(s_sched.get("end", 0))
+
+                if (
+                    s_raw in ("in_progress", "open", "waiting", "preparing", "scheduled")
+                    or (s_start > now_ts)
+                    or (s_start <= now_ts and (s_end == 0 or now_ts < s_end))
+                ):
+                    selected_race = r
+                    break
+
+            if not selected_race and races_list:
+                selected_race = races_list[0]
+
+            if selected_race:
+                track_id = int(selected_race.get("track_id", 5))
                 track_meta = TORN_TRACKS.get(track_id, {"name": f"Track #{track_id}", "length_mi": 2.0})
-                laps = int(latest.get("laps", 5))
-                status_raw = str(latest.get("status", "finished")).lower()
-                sched = latest.get("schedule", {})
+                laps = int(selected_race.get("laps", 5))
+                status_raw = str(selected_race.get("status", "finished")).lower()
+                sched = selected_race.get("schedule", {})
                 start_ts = int(sched.get("start", 0))
                 end_ts = int(sched.get("end", 0))
 
-                if status_raw == "in_progress" or (start_ts <= now_ts and (end_ts == 0 or now_ts < end_ts)):
+                is_active = (status_raw == "in_progress") or (
+                    start_ts <= now_ts and (end_ts == 0 or now_ts < end_ts)
+                )
+                is_staging = (status_raw in ("open", "waiting", "preparing", "scheduled")) or (
+                    start_ts > now_ts
+                )
+
+                if is_staging:
+                    wait_sec = max(0, start_ts - now_ts)
+                    wait_min = max(1, wait_sec // 60)
+                    cur_lap = 0
+                    lap_prog = 0.0
+                    est_speed = 0.0
+                    est_accel = 0.0
+                    race_status = f"GRID STAGING • STARTS IN {wait_min}M"
+                elif is_active:
                     est_duration = max(120, int(laps * track_meta["length_mi"] * 28))
                     elapsed = max(0, now_ts - start_ts)
                     overall_prog = min(0.99, elapsed / est_duration)
@@ -274,13 +308,6 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
                     race_status = f"LIVE ON TRACK • LAP {cur_lap}/{laps}"
                     est_speed = 132.0 + 18.0 * math.sin(lap_prog * 2 * math.pi)
                     est_accel = 1.4 * math.cos(lap_prog * 2 * math.pi)
-                elif status_raw in ("open", "waiting") or now_ts < start_ts:
-                    wait_min = max(1, (start_ts - now_ts) // 60)
-                    cur_lap = 0
-                    lap_prog = 0.0
-                    est_speed = 0.0
-                    est_accel = 0.0
-                    race_status = f"GRID STAGING • STARTS IN {wait_min}M"
                 else:
                     cur_lap = laps
                     lap_prog = 1.0
@@ -288,7 +315,7 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
                     est_accel = 0.0
                     race_status = f"FINISHED • {laps} LAPS"
 
-                results = latest.get("results", []) or latest.get("participants", [])
+                results = selected_race.get("results", []) or selected_race.get("participants", [])
                 standings = []
                 my_pos = 1
                 for idx, entry in enumerate(results[:6]):
@@ -300,12 +327,26 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
                     if is_me:
                         my_pos = pos
                         data["race"]["car_name"] = car_title
+
+                    if is_staging:
+                        driver_status = "GRID READY"
+                        driver_prog = 0.0
+                    elif crashed:
+                        driver_status = "CRASH"
+                        driver_prog = 0.0
+                    elif is_active:
+                        driver_status = "ON TRACK"
+                        driver_prog = (lap_prog - idx * 0.09) % 1.0
+                    else:
+                        driver_status = f"P{pos}"
+                        driver_prog = 1.0
+
                     standings.append({
                         "pos": pos,
                         "label": f"{USER_NAME} [{USER_ID}]" if is_me else f"Driver [{uid}]",
-                        "status": "CRASH" if crashed else (f"P{pos}" if status_raw == "finished" else "ON TRACK"),
+                        "status": driver_status,
                         "is_me": is_me,
-                        "progress": (lap_prog - idx * 0.09) % 1.0,
+                        "progress": driver_prog,
                     })
 
                 data["race"].update({
@@ -315,14 +356,14 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
                     "laps": laps,
                     "current_lap": cur_lap,
                     "progress": lap_prog,
-                    "is_official": bool(latest.get("is_official", True)),
+                    "is_official": bool(selected_race.get("is_official", True)),
                     "position": my_pos,
                     "total_drivers": max(len(results), 6),
                     "speed_mph": est_speed,
                     "accel": est_accel,
                     "standings": standings if standings else data["race"]["standings"],
                 })
-                print(f"[TORN API v2 OK] Track: {track_meta['name']} | Status: {race_status}", flush=True)
+                print(f"[TORN API v2 OK] Selected: {track_meta['name']} | Status: {race_status} | Drivers: {len(results)}", flush=True)
     except Exception as exc:
         print(f"[TORN API v2 EXCEPTION] {exc}", file=sys.stderr, flush=True)
 
@@ -412,7 +453,7 @@ def render_telemetry_banner(data: dict) -> bytes:
     draw.rectangle([10, 10, width - 11, 42], fill=(24, 15, 14), outline=crimson_dark)
     draw.text((20, 17), f"♦ {USER_NAME} [{USER_ID}] — LIVE TELEMETRY HUD", fill=gold, font=f_title)
     race = data["race"]
-    status_color = emerald if "LIVE" in race["status"] else gold
+    status_color = emerald if ("LIVE" in race["status"] or "STAGING" in race["status"]) else gold
     draw.text((width - 20, 19), race["status"], fill=status_color, font=f_bold, anchor="ra")
 
     # --- COLUMN 1: DRIVER DOSSIER ---
@@ -481,7 +522,10 @@ def render_telemetry_banner(data: dict) -> bytes:
     draw.rectangle([bar_x0, bar_y0, bar_x1, bar_y1], fill=(12, 10, 10), outline=(70, 50, 35))
     fill_w = int((bar_x1 - bar_x0) * max(0.04, min(1.0, race["current_lap"] / max(1, race["laps"]))))
     draw.rectangle([bar_x0, bar_y0, bar_x0 + fill_w, bar_y1], fill=crimson)
-    pct_txt = f"LAP {race['current_lap']}/{race['laps']} • CUR LAP: {int(race['progress'] * 100)}%"
+    if "STAGING" in race["status"]:
+        pct_txt = "GRID STAGING • CARS AT START LINE"
+    else:
+        pct_txt = f"LAP {race['current_lap']}/{race['laps']} • CUR LAP: {int(race['progress'] * 100)}%"
     draw.text(((bar_x0 + bar_x1) // 2, bar_y0 + 2), pct_txt, fill=ivory, font=f_small, anchor="ma")
 
     # --- COLUMN 3: RACE POSITIONING / LEADERBOARD ---
@@ -537,7 +581,6 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_HEAD(self):
-        """Responds to HEAD checks from Torn's media proxy and Render health monitors."""
         if self.path.startswith("/donyee_sig.png"):
             png_data = self.get_or_refresh_bytes()
             self.send_response(200)
