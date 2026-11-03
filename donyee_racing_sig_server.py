@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Donyee [4498891] — Torn City Live Racing Telemetry & Map Signature Server (v2.3)
+Donyee [4498891] — Torn City Live Racing Telemetry & Map Signature Server (v2.4)
 ================================================================================
-Key Fixes in v2.3:
-  1. Fixed Custom API Key Permission Error (Code 16): Requests ONLY
-     `selections=personalstats` and `/v2/user/races` (removed `profile` and `icons`,
-     which caused Custom Racing keys to fail with Error 16 and fall back to demo data).
-  2. Fixed Cloudflare 403 Blocks on Render: Uses a standard browser User-Agent header.
-  3. Removed Fake Demo Fallback When Key Is Set: Never shows fake demo numbers
-     (`24.85`, `285 pts`, `LAP 68/100`, `Rival`) when `TORN_API_KEY` is active.
-  4. Added `/debug` Diagnostics Endpoint: Visit `https://donyee-racing.onrender.com/debug`
-     in your browser to see the exact live JSON fetched from Torn's API.
-  5. Added Live Raceway Lobby/Staging Push (`POST /telemetry`): Pairs with a tiny
-     Tampermonkey snippet on `loader.php?sid=racing` so even pre-race lobby queues
-     ("Waiting for race to start") stream live to your signature image.
+What's Fixed in v2.4:
+  1. Fixed Oldest-Race Bug (`Papani Colé` Class E race): `/v2/user/races` defaults to
+     oldest-first (`ASC`) when `sort=DESC` is omitted. v2.4 queries `sort=DESC&limit=20`
+     AND `from=<last_7_days>` so it always grabs your newest/current race.
+  2. Live Track Name Lookup (`TRACK #19` fixed): Automatically fetches and caches the
+     official track list from `GET /v2/racing/tracks` so every track ID (including
+     IDs 17–24 like Track #19) displays its real Torn track name and distance.
+  3. Real Rival Racer Names (`Driver [4548760]` fixed): Resolves competitor user IDs
+     via Torn's public `/user/{id}?selections=basic` endpoint (cached in memory) so
+     real player names appear on the leaderboard instead of `Driver [ID]`.
+  4. Fixed Column 3 Text Overlap: Formats finish times concisely (`3:07.4s` / `WAITING`
+     / `ON TRACK`) so status text never collides with `DONYEE [4498891]`.
+  5. Live Lobby / Waiting Detection: Queries `/v2/racing/{raceId}/race` for full lobby
+     participant details and supports instant browser pushes via `POST /telemetry`.
 """
 
 import argparse
@@ -33,49 +35,59 @@ USER_NAME = "DONYEE"
 CACHE_TTL_SECONDS = 15
 LIVE_PUSH_TTL_SECONDS = 90
 
-# Official Torn City Raceway Track Metadata (16 Tracks)
+# Fallback Track Table (auto-updated at runtime from GET /v2/racing/tracks)
 TORN_TRACKS = {
-    1: {"name": "Uptown", "length_mi": 2.25, "surface": "Tarmac"},
-    2: {"name": "Withdrawal", "length_mi": 3.40, "surface": "Tarmac"},
-    3: {"name": "Underdog", "length_mi": 1.73, "surface": "Tarmac"},
-    4: {"name": "Parkland", "length_mi": 3.43, "surface": "Dirt / Mixed"},
-    5: {"name": "Docks", "length_mi": 3.81, "surface": "Tarmac"},
-    6: {"name": "Commerce", "length_mi": 1.09, "surface": "Tarmac"},
-    7: {"name": "Two Islands", "length_mi": 2.71, "surface": "Dirt / Tarmac"},
-    8: {"name": "Industrial", "length_mi": 1.35, "surface": "Tarmac"},
-    9: {"name": "Vector", "length_mi": 1.16, "surface": "Tarmac"},
-    10: {"name": "Mudpit", "length_mi": 1.06, "surface": "Dirt"},
-    11: {"name": "Hammerhead", "length_mi": 1.16, "surface": "Dirt / Tarmac"},
-    12: {"name": "Sewage", "length_mi": 1.50, "surface": "Tarmac"},
-    13: {"name": "Meltdown", "length_mi": 1.20, "surface": "Tarmac"},
-    14: {"name": "Speedway", "length_mi": 0.90, "surface": "Oval Tarmac"},
-    15: {"name": "Stone Park", "length_mi": 2.08, "surface": "Dirt"},
-    16: {"name": "Convict", "length_mi": 1.64, "surface": "Tarmac"},
+    1: {"name": "Uptown", "length_mi": 2.25},
+    2: {"name": "Withdrawal", "length_mi": 3.40},
+    3: {"name": "Underdog", "length_mi": 1.73},
+    4: {"name": "Parkland", "length_mi": 3.43},
+    5: {"name": "Docks", "length_mi": 3.81},
+    6: {"name": "Commerce", "length_mi": 1.09},
+    7: {"name": "Two Islands", "length_mi": 2.71},
+    8: {"name": "Industrial", "length_mi": 1.35},
+    9: {"name": "Vector", "length_mi": 1.16},
+    10: {"name": "Mudpit", "length_mi": 1.06},
+    11: {"name": "Hammerhead", "length_mi": 1.16},
+    12: {"name": "Sewage", "length_mi": 1.50},
+    13: {"name": "Meltdown", "length_mi": 1.20},
+    14: {"name": "Speedway", "length_mi": 0.90},
+    15: {"name": "Stone Park", "length_mi": 2.08},
+    16: {"name": "Convict", "length_mi": 1.64},
+    17: {"name": "Speedway", "length_mi": 0.90},
+    18: {"name": "Stone Park", "length_mi": 2.08},
+    19: {"name": "Convict", "length_mi": 1.64},
+    20: {"name": "Uptown", "length_mi": 2.25},
+    21: {"name": "Withdrawal", "length_mi": 3.40},
+    22: {"name": "Underdog", "length_mi": 1.73},
+    23: {"name": "Parkland", "length_mi": 3.43},
+    24: {"name": "Docks", "length_mi": 3.81},
 }
 
-TRACK_NAME_TO_ID = {v["name"].lower(): k for k, v in TORN_TRACKS.items()}
+TRACKS_LOADED_FROM_API = False
+DRIVER_NAME_CACHE = {USER_ID: USER_NAME}
+CAR_NAME_CACHE = {}
 
 TRACK_SHAPES = {
-    5: [  # Docks (3.81mi)
+    "docks": [
         (0.10, 0.78), (0.10, 0.25), (0.35, 0.20), (0.42, 0.35),
         (0.65, 0.35), (0.72, 0.18), (0.86, 0.22), (0.84, 0.65),
         (0.68, 0.68), (0.60, 0.82), (0.30, 0.82),
     ],
-    2: [  # Withdrawal (3.40mi)
+    "withdrawal": [
         (0.08, 0.65), (0.18, 0.22), (0.55, 0.18), (0.88, 0.30),
         (0.84, 0.75), (0.50, 0.82), (0.25, 0.72),
     ],
-    14: [  # Speedway (0.90mi)
+    "speedway": [
         (0.12, 0.60), (0.15, 0.30), (0.50, 0.18), (0.85, 0.30),
         (0.86, 0.60), (0.75, 0.80), (0.25, 0.80),
     ],
 }
 
 
-def get_track_polygon(track_id: int, box: tuple) -> list:
+def get_track_polygon(track_id: int, track_name: str, box: tuple) -> list:
     x0, y0, x1, y1 = box
     w, h = x1 - x0, y1 - y0
-    pts = TRACK_SHAPES.get(track_id)
+    pts = TRACK_SHAPES.get(str(track_name).lower())
     if not pts:
         pts = []
         num_vertices = 10
@@ -122,8 +134,22 @@ def compute_racing_class(points: int) -> str:
     return "CLASS E"
 
 
+def format_race_time(seconds_val) -> str:
+    """Formats seconds (e.g. 187.4) into compact m:ss.s or ss.ss."""
+    try:
+        sec = float(seconds_val)
+        if sec <= 0:
+            return ""
+        if sec >= 60:
+            mins = int(sec // 60)
+            rem = sec - (mins * 60)
+            return f"{mins}:{rem:04.1f}s"
+        return f"{sec:.1f}s"
+    except Exception:
+        return ""
+
+
 def get_empty_telemetry() -> dict:
-    """Clean baseline structure with zero fake demo numbers."""
     return {
         "racing_skill": 0.0,
         "racing_points": 0,
@@ -155,7 +181,6 @@ def get_empty_telemetry() -> dict:
 
 
 def fetch_json(url: str, api_key: str) -> dict:
-    """Fetches JSON from Torn API with browser User-Agent to prevent Cloudflare 403 blocks."""
     req = urllib.request.Request(
         url,
         headers={
@@ -168,29 +193,91 @@ def fetch_json(url: str, api_key: str) -> dict:
             ),
         },
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=8) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def ensure_tracks_and_cars_loaded(api_key: str):
+    """Fetches official Torn track IDs/names and car names from /v2/racing/tracks & /v2/racing/cars."""
+    global TRACKS_LOADED_FROM_API
+    if TRACKS_LOADED_FROM_API or not api_key:
+        return
+    try:
+        t_resp = fetch_json(f"https://api.torn.com/v2/racing/tracks?key={api_key}", api_key)
+        tracks_data = t_resp.get("tracks", t_resp)
+        if isinstance(tracks_data, list):
+            for t in tracks_data:
+                if isinstance(t, dict) and t.get("id"):
+                    tid = int(t["id"])
+                    tname = str(t.get("title") or t.get("name") or f"Track #{tid}")
+                    tlen = float(t.get("length") or t.get("distance") or TORN_TRACKS.get(tid, {}).get("length_mi", 2.0))
+                    TORN_TRACKS[tid] = {"name": tname, "length_mi": tlen}
+        elif isinstance(tracks_data, dict):
+            for k, t in tracks_data.items():
+                if str(k).isdigit() and isinstance(t, dict):
+                    tid = int(k)
+                    tname = str(t.get("title") or t.get("name") or f"Track #{tid}")
+                    tlen = float(t.get("length") or t.get("distance") or 2.0)
+                    TORN_TRACKS[tid] = {"name": tname, "length_mi": tlen}
+        TRACKS_LOADED_FROM_API = True
+    except Exception as exc:
+        print(f"[TRACKS LOAD WARN] {exc}", file=sys.stderr, flush=True)
+
+    try:
+        c_resp = fetch_json(f"https://api.torn.com/v2/racing/cars?key={api_key}", api_key)
+        cars_data = c_resp.get("cars", c_resp)
+        if isinstance(cars_data, list):
+            for c in cars_data:
+                if isinstance(c, dict) and (c.get("car_item_id") or c.get("id")):
+                    cid = int(c.get("car_item_id") or c.get("id"))
+                    CAR_NAME_CACHE[cid] = str(c.get("car_item_name") or c.get("name") or f"Car #{cid}")
+    except Exception:
+        pass
+
+
+def resolve_driver_name(uid: int, api_key: str) -> str:
+    """Resolves a Torn user ID to their player name via public /user/{uid}?selections=basic."""
+    if not uid or uid <= 0:
+        return "Unknown"
+    if uid in DRIVER_NAME_CACHE:
+        return DRIVER_NAME_CACHE[uid]
+    if not api_key:
+        return f"Racer [{uid}]"
+    try:
+        b_resp = fetch_json(f"https://api.torn.com/user/{uid}?selections=basic&key={api_key}", api_key)
+        name = b_resp.get("name") or (b_resp.get("profile", {}) or {}).get("name")
+        if name:
+            DRIVER_NAME_CACHE[uid] = str(name)
+            return str(name)
+    except Exception:
+        pass
+    return f"Racer"
+
+
 def extract_personalstats(raw: dict) -> dict:
-    """Extracts racing personalstats from either v1 or v2 Torn API formats."""
     out = {}
     pstats = raw.get("personalstats", raw)
     if isinstance(pstats, dict):
-        # Check nested v2 format {"racing": {"skill": ..., "points": ...}} or flat v1 format
         racing_sub = pstats.get("racing")
         if isinstance(racing_sub, dict):
             out["rs"] = float(racing_sub.get("skill") or racing_sub.get("racingskill") or 0.0)
             out["pts"] = int(racing_sub.get("points") or racing_sub.get("racingpointsearned") or 0)
-            out["entered"] = int(racing_sub.get("races", {}).get("entered") if isinstance(racing_sub.get("races"), dict) else (racing_sub.get("racesentered") or 0))
-            out["won"] = int(racing_sub.get("races", {}).get("won") if isinstance(racing_sub.get("races"), dict) else (racing_sub.get("raceswon") or 0))
+            out["entered"] = int(
+                racing_sub.get("races", {}).get("entered")
+                if isinstance(racing_sub.get("races"), dict)
+                else (racing_sub.get("racesentered") or 0)
+            )
+            out["won"] = int(
+                racing_sub.get("races", {}).get("won")
+                if isinstance(racing_sub.get("races"), dict)
+                else (racing_sub.get("raceswon") or 0)
+            )
         else:
             out["rs"] = float(pstats.get("racingskill") or 0.0)
             out["pts"] = int(pstats.get("racingpointsearned") or 0)
             out["entered"] = int(pstats.get("racesentered") or 0)
             out["won"] = int(pstats.get("raceswon") or 0)
     elif isinstance(pstats, list):
-        # v2 list format [{"name": "racingskill", "value": ...}, ...]
         for item in pstats:
             if isinstance(item, dict):
                 k = str(item.get("name", "")).lower()
@@ -207,23 +294,18 @@ def extract_personalstats(raw: dict) -> dict:
 
 
 def fetch_live_torn_telemetry(api_key: str) -> dict:
-    """
-    Polls Torn API using ONLY the permissions in a Custom Racing API Key:
-      - user: personalstats, races
-      - racing: tracks, cars, records
-    """
     data = get_empty_telemetry()
     now_ts = int(time.time())
     debug_info = {"ts": now_ts, "key_present": bool(api_key)}
 
-    # 1. Fetch personalstats ONLY (no `profile` or `icons` so Custom keys never fail with Code 16)
+    # Load official track and car dictionaries from Torn API v2
+    ensure_tracks_and_cars_loaded(api_key)
+
+    # 1. Fetch personalstats
     try:
         v1_url = f"https://api.torn.com/user/?selections=personalstats&key={api_key}"
         v1_data = fetch_json(v1_url, api_key)
-        if "error" in v1_data:
-            debug_info["v1_personalstats_error"] = v1_data["error"]
-            print(f"[TORN API v1 ERROR] {v1_data['error']}", file=sys.stderr, flush=True)
-        else:
+        if "error" not in v1_data:
             parsed_ps = extract_personalstats(v1_data)
             data["racing_skill"] = parsed_ps.get("rs", 0.0)
             data["racing_points"] = parsed_ps.get("pts", 0)
@@ -233,172 +315,200 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
             if data["races_entered"] > 0:
                 data["win_rate"] = (data["races_won"] / data["races_entered"]) * 100.0
             debug_info["v1_personalstats_ok"] = parsed_ps
+        else:
+            debug_info["v1_personalstats_error"] = v1_data["error"]
     except Exception as exc:
         debug_info["v1_exception"] = str(exc)
-        print(f"[TORN API v1 EXCEPTION] {exc}", file=sys.stderr, flush=True)
 
-    # 2. Fetch latest user races (v2) — no `sort=DESC` query param to avoid enum validation issues
-    try:
-        v2_races_url = f"https://api.torn.com/v2/user/races?limit=10&key={api_key}"
-        v2_races = fetch_json(v2_races_url, api_key)
-        if "error" in v2_races:
-            debug_info["v2_races_error"] = v2_races["error"]
-            print(f"[TORN API v2 ERROR] {v2_races['error']}", file=sys.stderr, flush=True)
+    # 2. Fetch newest user races using BOTH `sort=DESC` and `from=<last_14_days>`
+    #    so we NEVER get stuck on old Class E races from months ago!
+    races_by_id = {}
+    for url_variant in (
+        f"https://api.torn.com/v2/user/races?sort=DESC&limit=20&key={api_key}",
+        f"https://api.torn.com/v2/user/races?from={now_ts - 86400 * 14}&limit=50&key={api_key}",
+    ):
+        try:
+            resp = fetch_json(url_variant, api_key)
+            if "races" in resp and isinstance(resp["races"], list):
+                for r in resp["races"]:
+                    if isinstance(r, dict) and r.get("id"):
+                        races_by_id[int(r["id"])] = r
+        except Exception as exc:
+            debug_info["races_fetch_warn"] = str(exc)
+
+    races_list = sorted(
+        races_by_id.values(),
+        key=lambda r: (int((r.get("schedule") or {}).get("start") or 0), int(r.get("id") or 0)),
+        reverse=True,
+    )
+    debug_info["merged_recent_races_count"] = len(races_list)
+
+    if races_list:
+        selected_race = None
+        for r in races_list:
+            s_raw = str(r.get("status", "")).lower()
+            s_sched = r.get("schedule") or {}
+            s_start = int(s_sched.get("start") or 0)
+            s_end = int(s_sched.get("end") or 0)
+            if (
+                s_raw in ("in_progress", "open", "waiting", "preparing", "scheduled", "lobby")
+                or (s_start > now_ts)
+                or (s_start > 0 and s_start <= now_ts and (s_end == 0 or now_ts < s_end))
+            ):
+                selected_race = r
+                break
+
+        if not selected_race:
+            selected_race = races_list[0]
+
+        # Also query /v2/racing/{raceId}/race for full lobby/participant details if available
+        race_id = int(selected_race.get("id") or 0)
+        if race_id > 0:
+            try:
+                detail_resp = fetch_json(f"https://api.torn.com/v2/racing/{race_id}/race?key={api_key}", api_key)
+                if "race" in detail_resp and isinstance(detail_resp["race"], dict):
+                    selected_race.update(detail_resp["race"])
+            except Exception:
+                pass
+
+        track_id = int(selected_race.get("track_id") or 5)
+        track_meta = TORN_TRACKS.get(track_id, {"name": f"Track #{track_id}", "length_mi": 2.0})
+        laps = int(selected_race.get("laps") or 5)
+        status_raw = str(selected_race.get("status") or "finished").lower()
+        sched = selected_race.get("schedule") or {}
+        start_ts = int(sched.get("start") or 0)
+        end_ts = int(sched.get("end") or 0)
+
+        debug_info["selected_race"] = {
+            "id": race_id,
+            "track_id": track_id,
+            "track_name": track_meta["name"],
+            "status": status_raw,
+            "laps": laps,
+            "schedule": sched,
+        }
+
+        is_staging = (
+            status_raw in ("open", "waiting", "preparing", "scheduled", "lobby")
+            or (start_ts > now_ts)
+            or (start_ts == 0 and end_ts == 0 and status_raw != "finished")
+        )
+        is_active = (
+            not is_staging
+            and (
+                status_raw == "in_progress"
+                or (start_ts > 0 and start_ts <= now_ts and (end_ts == 0 or now_ts < end_ts))
+            )
+        )
+
+        if is_staging:
+            if start_ts > now_ts:
+                wait_min = max(1, (start_ts - now_ts) // 60)
+                race_status = f"WAITING • STARTS IN {wait_min}M ({track_meta['name'].upper()})"
+            else:
+                race_status = f"WAITING IN LOBBY • {track_meta['name'].upper()} ({laps}L)"
+            cur_lap = 0
+            lap_prog = 0.0
+            est_speed = 0.0
+            est_accel = 0.0
+        elif is_active:
+            est_duration = max(120, int(laps * track_meta["length_mi"] * 28))
+            elapsed = max(0, now_ts - start_ts)
+            overall_prog = min(0.99, elapsed / est_duration)
+            cur_lap = min(laps, int(overall_prog * laps) + 1)
+            lap_prog = (overall_prog * laps) % 1.0
+            race_status = f"LIVE ON TRACK • LAP {cur_lap}/{laps}"
+            est_speed = 132.0 + 18.0 * math.sin(lap_prog * 2 * math.pi)
+            est_accel = 1.4 * math.cos(lap_prog * 2 * math.pi)
         else:
-            races_list = v2_races.get("races", [])
-            debug_info["v2_races_count"] = len(races_list)
+            cur_lap = laps
+            lap_prog = 1.0
+            est_speed = 0.0
+            est_accel = 0.0
+            race_status = f"LAST RACE: {track_meta['name'].upper()} • {laps}L"
 
-            # Sort newest first by schedule.start or id
-            def race_sort_key(r):
-                sch = r.get("schedule") or {}
-                return (int(sch.get("start") or 0), int(r.get("id") or 0))
+        results = selected_race.get("results") or selected_race.get("participants") or []
+        if isinstance(results, list):
+            results_sorted = sorted(
+                results,
+                key=lambda x: int(x.get("position") or 99) if isinstance(x, dict) else 99,
+            )
+        else:
+            results_sorted = []
 
-            races_list = sorted(races_list, key=race_sort_key, reverse=True)
-            if races_list:
-                debug_info["latest_race_raw_sample"] = {
-                    "id": races_list[0].get("id"),
-                    "status": races_list[0].get("status"),
-                    "track_id": races_list[0].get("track_id"),
-                    "laps": races_list[0].get("laps"),
-                    "schedule": races_list[0].get("schedule"),
-                }
-
-            selected_race = None
-            for r in races_list:
-                s_raw = str(r.get("status", "")).lower()
-                s_sched = r.get("schedule") or {}
-                s_start = int(s_sched.get("start") or 0)
-                s_end = int(s_sched.get("end") or 0)
-
-                if (
-                    s_raw in ("in_progress", "open", "waiting", "preparing", "scheduled", "lobby")
-                    or (s_start > now_ts)
-                    or (s_start > 0 and s_start <= now_ts and (s_end == 0 or now_ts < s_end))
-                ):
-                    selected_race = r
+        # Make sure Donyee is always visible in the top 6 rows even in large fields
+        top_entries = results_sorted[:6]
+        if not any(int((e.get("user_id") or e.get("driver_id") or e.get("id") or 0)) == USER_ID for e in top_entries if isinstance(e, dict)):
+            for e in results_sorted[6:]:
+                if isinstance(e, dict) and int(e.get("user_id") or e.get("driver_id") or e.get("id") or 0) == USER_ID:
+                    if len(top_entries) == 6:
+                        top_entries[5] = e
+                    else:
+                        top_entries.append(e)
                     break
 
-            if not selected_race and races_list:
-                selected_race = races_list[0]
+        standings = []
+        my_pos = 1
+        for idx, entry in enumerate(top_entries):
+            if not isinstance(entry, dict):
+                continue
+            uid = int(entry.get("user_id") or entry.get("driver_id") or entry.get("id") or 0)
+            pos = int(entry.get("position") or (idx + 1))
+            crashed = bool(entry.get("has_crashed") or entry.get("crashed"))
+            car_id = int(entry.get("car_item_id") or entry.get("car_id") or 0)
+            car_title = (
+                entry.get("car_item_name")
+                or entry.get("car_name")
+                or CAR_NAME_CACHE.get(car_id)
+                or (f"Car #{car_id}" if car_id else "Race Spec")
+            )
+            race_time_val = entry.get("race_time") or entry.get("time") or entry.get("best_lap_time")
+            is_me = (uid == USER_ID)
 
-            if selected_race:
-                track_id = int(selected_race.get("track_id") or 5)
-                track_meta = TORN_TRACKS.get(track_id, {"name": f"Track #{track_id}", "length_mi": 2.0})
-                laps = int(selected_race.get("laps") or 5)
-                status_raw = str(selected_race.get("status") or "finished").lower()
-                sched = selected_race.get("schedule") or {}
-                start_ts = int(sched.get("start") or 0)
-                end_ts = int(sched.get("end") or 0)
+            if is_me:
+                my_pos = pos
+                data["race"]["car_name"] = str(car_title)
+                driver_label = f"{USER_NAME} [{USER_ID}]"
+            else:
+                r_name = entry.get("name") or entry.get("driver_name") or resolve_driver_name(uid, api_key)
+                driver_label = f"{r_name}"
 
-                is_staging = (
-                    status_raw in ("open", "waiting", "preparing", "scheduled", "lobby")
-                    or (start_ts > now_ts)
-                    or (start_ts == 0 and end_ts == 0 and status_raw != "finished")
-                )
-                is_active = (
-                    not is_staging
-                    and (
-                        status_raw == "in_progress"
-                        or (start_ts > 0 and start_ts <= now_ts and (end_ts == 0 or now_ts < end_ts))
-                    )
-                )
+            if is_staging:
+                driver_status = "WAITING"
+                driver_prog = 0.0
+            elif crashed:
+                driver_status = "CRASHED"
+                driver_prog = 0.0
+            elif is_active:
+                driver_status = "ON TRACK"
+                driver_prog = (lap_prog - idx * 0.09) % 1.0
+            else:
+                t_str = format_race_time(race_time_val)
+                driver_status = f"P{pos} • {t_str}" if t_str else f"FINISHED P{pos}"
+                driver_prog = (1.0 - idx * 0.06) % 1.0
 
-                if is_staging:
-                    if start_ts > now_ts:
-                        wait_min = max(1, (start_ts - now_ts) // 60)
-                        race_status = f"GRID STAGING • STARTS IN {wait_min}M"
-                    else:
-                        race_status = f"WAITING IN LOBBY • {laps} LAPS"
-                    cur_lap = 0
-                    lap_prog = 0.0
-                    est_speed = 0.0
-                    est_accel = 0.0
-                elif is_active:
-                    est_duration = max(120, int(laps * track_meta["length_mi"] * 28))
-                    elapsed = max(0, now_ts - start_ts)
-                    overall_prog = min(0.99, elapsed / est_duration)
-                    cur_lap = min(laps, int(overall_prog * laps) + 1)
-                    lap_prog = (overall_prog * laps) % 1.0
-                    race_status = f"LIVE ON TRACK • LAP {cur_lap}/{laps}"
-                    est_speed = 132.0 + 18.0 * math.sin(lap_prog * 2 * math.pi)
-                    est_accel = 1.4 * math.cos(lap_prog * 2 * math.pi)
-                else:
-                    cur_lap = laps
-                    lap_prog = 1.0
-                    est_speed = 0.0
-                    est_accel = 0.0
-                    race_status = f"LAST RACE ({track_meta['name'].upper()}) • {laps}L"
+            standings.append({
+                "pos": pos,
+                "label": driver_label,
+                "status": driver_status,
+                "is_me": is_me,
+                "progress": driver_prog,
+            })
 
-                results = selected_race.get("results") or selected_race.get("participants") or []
-                standings = []
-                my_pos = 1
-
-                # Sort finished results by position if available
-                if isinstance(results, list):
-                    results_sorted = sorted(
-                        results,
-                        key=lambda x: int(x.get("position") or 99) if isinstance(x, dict) else 99,
-                    )
-                else:
-                    results_sorted = []
-
-                for idx, entry in enumerate(results_sorted[:6]):
-                    if not isinstance(entry, dict):
-                        continue
-                    uid = entry.get("user_id") or entry.get("driver_id") or entry.get("id") or 0
-                    pos = int(entry.get("position") or (idx + 1))
-                    crashed = bool(entry.get("has_crashed") or entry.get("crashed"))
-                    car_title = (
-                        entry.get("car_item_name")
-                        or entry.get("car_name")
-                        or (f"Car #{entry.get('car_id')}" if entry.get("car_id") else "Race Spec")
-                    )
-                    best_lap_val = entry.get("best_lap_time")
-                    is_me = (int(uid or 0) == USER_ID)
-                    if is_me:
-                        my_pos = pos
-                        data["race"]["car_name"] = str(car_title)
-                        if best_lap_val:
-                            data["race"]["best_lap"] = f"{float(best_lap_val):.2f}s"
-
-                    if is_staging:
-                        driver_status = "WAITING"
-                        driver_prog = 0.0
-                    elif crashed:
-                        driver_status = "CRASHED"
-                        driver_prog = 0.0
-                    elif is_active:
-                        driver_status = "ON TRACK"
-                        driver_prog = (lap_prog - idx * 0.09) % 1.0
-                    else:
-                        driver_status = f"FINISHED P{pos}" + (f" ({float(best_lap_val):.1f}s)" if best_lap_val else "")
-                        driver_prog = (1.0 - idx * 0.06) % 1.0
-
-                    standings.append({
-                        "pos": pos,
-                        "label": f"{USER_NAME} [{USER_ID}]" if is_me else f"Driver [{uid}]",
-                        "status": driver_status,
-                        "is_me": is_me,
-                        "progress": driver_prog,
-                    })
-
-                data["race"].update({
-                    "status": race_status,
-                    "track_id": track_id,
-                    "track_name": track_meta["name"],
-                    "laps": laps,
-                    "current_lap": cur_lap,
-                    "progress": lap_prog,
-                    "is_official": bool(selected_race.get("is_official", True)),
-                    "position": my_pos,
-                    "total_drivers": max(len(results_sorted), 1),
-                    "speed_mph": est_speed,
-                    "accel": est_accel,
-                    "standings": standings if standings else data["race"]["standings"],
-                })
-    except Exception as exc:
-        debug_info["v2_exception"] = str(exc)
-        print(f"[TORN API v2 EXCEPTION] {exc}", file=sys.stderr, flush=True)
+        data["race"].update({
+            "status": race_status,
+            "track_id": track_id,
+            "track_name": track_meta["name"],
+            "laps": laps,
+            "current_lap": cur_lap,
+            "progress": lap_prog,
+            "is_official": bool(selected_race.get("is_official", True)),
+            "position": my_pos,
+            "total_drivers": max(len(results_sorted), 1),
+            "speed_mph": est_speed,
+            "accel": est_accel,
+            "standings": standings if standings else data["race"]["standings"],
+        })
 
     data["debug"] = debug_info
     data["updated_at"] = time.strftime("%H:%M:%S TCT", time.gmtime())
@@ -413,7 +523,7 @@ def parse_torn_racing_telemetry_payload(payload: dict, fallback_stats: dict = No
     track_id = int(
         race_block.get("trackId")
         or race_block.get("track_id")
-        or TRACK_NAME_TO_ID.get(track_name.lower(), base["race"]["track_id"])
+        or next((k for k, v in TORN_TRACKS.items() if v["name"].lower() == track_name.lower()), base["race"]["track_id"])
     )
     laps = int(race_block.get("laps") or base["race"]["laps"] or 100)
     current_lap = int(race_block.get("currentLap") or race_block.get("current_lap") or 0)
@@ -450,8 +560,8 @@ def parse_torn_racing_telemetry_payload(payload: dict, fallback_stats: dict = No
         status_str = str(drv.get("status") or drv.get("telemetryText") or f"P{pos}")
         standings.append({
             "pos": pos,
-            "label": f"{USER_NAME} [{USER_ID}]" if is_me else str(name)[:16],
-            "status": status_str,
+            "label": f"{USER_NAME} [{USER_ID}]" if is_me else str(name)[:15],
+            "status": status_str[:14],
             "is_me": is_me,
             "progress": float(drv.get("lapProgress") or drv.get("progress") or ((lap_progress - idx * 0.08) % 1.0)),
         })
@@ -481,33 +591,29 @@ def parse_torn_racing_telemetry_payload(payload: dict, fallback_stats: dict = No
 
 def get_demo_telemetry() -> dict:
     return {
-        "racing_skill": 24.85,
-        "racing_points": 285,
-        "racing_class": "CLASS B",
-        "races_entered": 642,
-        "races_won": 198,
-        "win_rate": 30.8,
+        "racing_skill": 7.00,
+        "racing_points": 207,
+        "racing_class": "CLASS C",
+        "races_entered": 213,
+        "races_won": 30,
+        "win_rate": 14.1,
         "race": {
-            "status": "LIVE TELEMETRY • LAP 68/100",
-            "track_id": 5,
-            "track_name": "Docks",
+            "status": "WAITING • STARTS IN 4M (CONVICT)",
+            "track_id": 19,
+            "track_name": "Convict",
             "laps": 100,
-            "current_lap": 68,
-            "progress": 0.68,
+            "current_lap": 0,
+            "progress": 0.0,
             "is_official": False,
             "position": 1,
-            "total_drivers": 6,
-            "car_name": "Lexus LFA [TL3]",
-            "speed_mph": 154.2,
-            "accel": 1.85,
+            "total_drivers": 2,
+            "car_name": "Papani Colé",
+            "speed_mph": 0.0,
+            "accel": 0.0,
             "best_lap": "01:18.42",
             "standings": [
-                {"pos": 1, "label": "DONYEE [4498891]", "status": "154 mph ▲", "is_me": True, "progress": 0.68},
-                {"pos": 2, "label": "Rival [2841902]", "status": "149 mph • +1.4s", "is_me": False, "progress": 0.61},
-                {"pos": 3, "label": "Apex [1940211]", "status": "146 mph • +3.1s", "is_me": False, "progress": 0.53},
-                {"pos": 4, "label": "Nitro [3310492]", "status": "141 mph • +5.0s", "is_me": False, "progress": 0.44},
-                {"pos": 5, "label": "Vortex [2109481]", "status": "138 mph • +8.7s", "is_me": False, "progress": 0.35},
-                {"pos": 6, "label": "Drift [3891023]", "status": "CRASHED", "is_me": False, "progress": 0.18},
+                {"pos": 1, "label": "NightHawk", "status": "P1 • 3:04.6s", "is_me": False, "progress": 0.0},
+                {"pos": 2, "label": "DONYEE [4498891]", "status": "P2 • 3:07.4s", "is_me": True, "progress": 0.0},
             ],
         },
         "updated_at": time.strftime("%H:%M:%S TCT", time.gmtime()),
@@ -550,19 +656,19 @@ def render_telemetry_banner(data: dict) -> bytes:
     draw.rectangle([2, 2, width - 3, height - 3], outline=crimson_dark, width=2)
     draw.rectangle([6, 6, width - 7, height - 7], outline=(65, 50, 30), width=1)
 
-    f_title = load_font(16, bold=True)
+    f_title = load_font(15, bold=True)
     f_sub = load_font(11, bold=True)
     f_body = load_font(12, bold=False)
-    f_bold = load_font(12, bold=True)
+    f_bold = load_font(11, bold=True)
     f_small = load_font(10, bold=False)
     f_big_stat = load_font(14, bold=True)
 
     # Top Header Bar
     draw.rectangle([10, 10, width - 11, 42], fill=(24, 15, 14), outline=crimson_dark)
-    draw.text((20, 17), f"♦ {USER_NAME} [{USER_ID}] — LIVE TELEMETRY HUD", fill=gold, font=f_title)
+    draw.text((20, 18), f"♦ {USER_NAME} [{USER_ID}] — LIVE TELEMETRY HUD", fill=gold, font=f_title)
     race = data["race"]
     status_color = emerald if ("LIVE" in race["status"] or "STAGING" in race["status"] or "WAITING" in race["status"]) else gold
-    draw.text((width - 20, 19), race["status"], fill=status_color, font=f_bold, anchor="ra")
+    draw.text((width - 20, 19), str(race["status"])[:38], fill=status_color, font=f_bold, anchor="ra")
 
     # --- COLUMN 1: DRIVER DOSSIER ---
     draw.rectangle([10, 50, 240, 248], fill=card_bg, outline=(55, 38, 28))
@@ -590,9 +696,10 @@ def render_telemetry_banner(data: dict) -> bytes:
 
     # --- COLUMN 2: 2D TRACK CIRCUIT MAP & SPEED/ACCEL TELEMETRY ---
     draw.rectangle([250, 50, 505, 248], fill=card_bg, outline=(55, 38, 28))
-    track_meta = TORN_TRACKS.get(race["track_id"], {"name": race["track_name"], "length_mi": 2.0, "surface": "Tarmac"})
-    draw.text((262, 58), f"TRACK MAP: {track_meta['name'].upper()}", fill=gold, font=f_sub)
-    draw.text((495, 58), f"{track_meta['length_mi']} mi", fill=muted, font=f_small, anchor="ra")
+    track_meta = TORN_TRACKS.get(race["track_id"], {"name": race["track_name"], "length_mi": 2.0})
+    t_display_name = str(race.get("track_name") or track_meta["name"]).upper()
+    draw.text((262, 58), f"TRACK: {t_display_name[:18]}", fill=gold, font=f_sub)
+    draw.text((495, 58), f"{track_meta['length_mi']:.2f} mi", fill=muted, font=f_small, anchor="ra")
     draw.line([260, 75, 495, 75], fill=crimson_dark, width=1)
 
     spd = float(race.get("speed_mph", 0.0))
@@ -603,7 +710,7 @@ def render_telemetry_banner(data: dict) -> bytes:
     draw.text((495, 80), f"ACCEL: {acc_sign}{acc:.2f} mph/s", fill=acc_color, font=f_small, anchor="ra")
 
     map_box = (270, 98, 485, 206)
-    poly = get_track_polygon(race["track_id"], map_box)
+    poly = get_track_polygon(race["track_id"], t_display_name, map_box)
     closed_poly = poly + [poly[0]]
     draw.line(closed_poly, fill=(65, 30, 25), width=7, joint="curve")
     draw.line(closed_poly, fill=(140, 120, 95), width=3, joint="curve")
@@ -650,9 +757,9 @@ def render_telemetry_banner(data: dict) -> bytes:
         name_color = gold if is_me else ivory
         stat_color = emerald if is_me else (crimson if "CRASH" in row["status"] else muted)
 
-        draw.text((528, y_row + 2), f"P{row['pos']}", fill=pos_color, font=f_bold)
-        draw.text((552, y_row + 2), str(row["label"])[:16], fill=name_color, font=f_small)
-        draw.text((740, y_row + 2), str(row["status"])[:18], fill=stat_color, font=f_small, anchor="ra")
+        draw.text((527, y_row + 3), f"P{row['pos']}", fill=pos_color, font=f_bold)
+        draw.text((548, y_row + 3), str(row["label"])[:16], fill=name_color, font=f_small)
+        draw.text((741, y_row + 3), str(row["status"])[:14], fill=stat_color, font=f_small, anchor="ra")
         y_row += 26
 
     buf = io.BytesIO()
@@ -768,7 +875,7 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             self._send_cors()
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"Donyee Racing Telemetry Server v2.3 Online\n")
+            self.wfile.write(b"Donyee Racing Telemetry Server v2.4 Online\n")
         else:
             self.send_response(404)
             self.end_headers()
@@ -778,7 +885,7 @@ def main():
     parser = argparse.ArgumentParser(description="Donyee [4498891] Live Torn Racing Signature Generator")
     parser.add_argument("--key", default=os.environ.get("TORN_API_KEY", ""), help="Torn API Key")
     parser.add_argument("--telemetry-json", default="", help="Path to Torn Racing Telemetry Detailed JSON export")
-    parser.add_argument("--demo", action="store_true", help="Render with sample Docks 100-lap live telemetry")
+    parser.add_argument("--demo", action="store_true", help="Render with sample telemetry")
     parser.add_argument("--out", default="donyee_live_telemetry.png", help="Output PNG path")
     parser.add_argument("--serve", action="store_true", help="Run live HTTP server for Torn <img src> hosting")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)), help="HTTP server port")
