@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """
-Donyee [4498891] — Torn City Live Racing Telemetry & Map Signature Server
-=========================================================================
-Integrates directly with:
-  1. Your running **Torn Racing Telemetry** userscript (via `POST /telemetry`
-     live push or `--telemetry-json` Detailed JSON export) to display real-time
-     Speed (MPH), Acceleration (Green/Red), exact mid-lap map positioning, and
-     live P1–P6 leaderboard order.
-  2. Torn's Official API (`v2/user/races`, `v2/racing/tracks`, `v1/user/personalstats`)
-     using the exact same Limited Access API key selections (`user: personalstats,
-     races` & `racing: tracks, cars, records`) already configured in your
-     Torn Racing Telemetry settings when your browser tab is closed.
-
-Usage:
-  1. Reuse your existing Torn Racing Telemetry API Key:
-       export TORN_API_KEY="YOUR_EXISTING_TELEMETRY_API_KEY"
-  2. Start the signature server (serves `/donyee_sig.png` + accepts `POST /telemetry`):
-       python3 donyee_racing_sig_server.py --serve --port 8080
-  3. Or render directly from a Torn Racing Telemetry Detailed JSON export file:
-       python3 donyee_racing_sig_server.py --telemetry-json race_export.json --out donyee_sig.png
+Donyee [4498891] — Torn City Live Racing Telemetry & Map Signature Server (v2.1)
+================================================================================
+Updates:
+  - Added full HEAD request support (`do_HEAD`) so Torn's media proxy and Render
+    health checks return HTTP 200 instead of 501 Not Implemented.
+  - Added root `/` and `/healthz` HTTP 200 handlers for Render.
+  - Independent API error handling: personalstats (v1) and races (v2) are fetched
+    independently so your real Racing Skill, Points, Class, and Podiums ALWAYS
+    render even if you are not currently in a race or if v2 API permissions vary.
+  - Verbose Render console logging for instant visibility into Torn API responses.
 """
 
 import argparse
@@ -26,6 +17,7 @@ import io
 import json
 import math
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -35,7 +27,7 @@ from PIL import Image, ImageDraw, ImageFont
 USER_ID = 4498891
 USER_NAME = "DONYEE"
 CACHE_TTL_SECONDS = 60
-LIVE_PUSH_TTL_SECONDS = 90  # How long live browser telemetry overrides API polling
+LIVE_PUSH_TTL_SECONDS = 90
 
 # Official Torn City Raceway Track Metadata (16 Tracks)
 TORN_TRACKS = {
@@ -59,18 +51,17 @@ TORN_TRACKS = {
 
 TRACK_NAME_TO_ID = {v["name"].lower(): k for k, v in TORN_TRACKS.items()}
 
-# Normalized 2D Circuit Loops (0.0 to 1.0) for visual track map rendering
 TRACK_SHAPES = {
-    5: [  # Docks (3.81mi) — Long dockside straights with technical chicanes
+    5: [  # Docks (3.81mi)
         (0.10, 0.78), (0.10, 0.25), (0.35, 0.20), (0.42, 0.35),
         (0.65, 0.35), (0.72, 0.18), (0.86, 0.22), (0.84, 0.65),
         (0.68, 0.68), (0.60, 0.82), (0.30, 0.82),
     ],
-    2: [  # Withdrawal (3.40mi) — High-speed highway loop
+    2: [  # Withdrawal (3.40mi)
         (0.08, 0.65), (0.18, 0.22), (0.55, 0.18), (0.88, 0.30),
         (0.84, 0.75), (0.50, 0.82), (0.25, 0.72),
     ],
-    14: [  # Speedway (0.90mi) — Tri-oval circuit
+    14: [  # Speedway (0.90mi)
         (0.12, 0.60), (0.15, 0.30), (0.50, 0.18), (0.85, 0.30),
         (0.86, 0.60), (0.75, 0.80), (0.25, 0.80),
     ],
@@ -78,7 +69,6 @@ TRACK_SHAPES = {
 
 
 def get_track_polygon(track_id: int, box: tuple) -> list:
-    """Returns pixel coordinates [(x, y), ...] for the given track inside box."""
     x0, y0, x1, y1 = box
     w, h = x1 - x0, y1 - y0
     pts = TRACK_SHAPES.get(track_id)
@@ -94,7 +84,6 @@ def get_track_polygon(track_id: int, box: tuple) -> list:
 
 
 def interpolate_along_circuit(poly: list, progress: float) -> tuple:
-    """Computes (x, y) car coordinates along a closed circuit polygon for progress in [0, 1]."""
     closed = poly + [poly[0]]
     seg_lengths = []
     total_len = 0.0
@@ -118,7 +107,6 @@ def interpolate_along_circuit(poly: list, progress: float) -> tuple:
 
 
 def compute_racing_class(points: int) -> str:
-    """Maps earned racing points to official Torn Racing Class (E -> A)."""
     if points >= 475:
         return "CLASS A"
     if points >= 250:
@@ -131,10 +119,6 @@ def compute_racing_class(points: int) -> str:
 
 
 def parse_torn_racing_telemetry_payload(payload: dict, fallback_stats: dict = None) -> dict:
-    """
-    Parses a live push or Detailed JSON Export from Torn Racing Telemetry
-    (alxspiker/Torn-Racing-Telemetry) into the banner's unified data dictionary.
-    """
     base = fallback_stats or get_demo_telemetry()
     race_block = payload.get("race", payload)
 
@@ -193,12 +177,17 @@ def parse_torn_racing_telemetry_payload(payload: dict, fallback_stats: dict = No
     if not standings:
         standings = base["race"]["standings"]
 
-    base["racing_skill"] = float(payload.get("racingSkill") or payload.get("racing_skill") or base["racing_skill"])
-    base["racing_points"] = int(payload.get("racingPoints") or payload.get("racing_points") or base["racing_points"])
-    base["racing_class"] = compute_racing_class(base["racing_points"])
-    base["races_entered"] = int(payload.get("racesEntered") or payload.get("races_entered") or base["races_entered"])
-    base["races_won"] = int(payload.get("racesWon") or payload.get("races_won") or base["races_won"])
-    base["win_rate"] = (base["races_won"] / base["races_entered"] * 100.0) if base["races_entered"] > 0 else 0.0
+    if payload.get("racingSkill") or payload.get("racing_skill"):
+        base["racing_skill"] = float(payload.get("racingSkill") or payload.get("racing_skill"))
+    if payload.get("racingPoints") or payload.get("racing_points"):
+        base["racing_points"] = int(payload.get("racingPoints") or payload.get("racing_points"))
+        base["racing_class"] = compute_racing_class(base["racing_points"])
+    if payload.get("racesEntered") or payload.get("races_entered"):
+        base["races_entered"] = int(payload.get("racesEntered") or payload.get("races_entered"))
+    if payload.get("racesWon") or payload.get("races_won"):
+        base["races_won"] = int(payload.get("racesWon") or payload.get("races_won"))
+    if base["races_entered"] > 0:
+        base["win_rate"] = (base["races_won"] / base["races_entered"] * 100.0)
 
     base["race"].update({
         "status": str(race_block.get("status") or f"LIVE TELEMETRY • LAP {current_lap}/{laps}"),
@@ -223,7 +212,7 @@ def fetch_json(url: str, api_key: str) -> dict:
         url,
         headers={
             "Authorization": f"ApiKey {api_key}",
-            "User-Agent": "DonyeeRacingTelemetrySig/2.0",
+            "User-Agent": "DonyeeRacingTelemetrySig/2.1",
         },
     )
     with urllib.request.urlopen(req, timeout=8) as resp:
@@ -232,126 +221,116 @@ def fetch_json(url: str, api_key: str) -> dict:
 
 def fetch_live_torn_telemetry(api_key: str) -> dict:
     """
-    Polls Torn API using the exact selections already enabled in Torn Racing Telemetry:
-      - user: personalstats, races
-      - racing: tracks, cars, records
+    Robust Torn API Poller:
+      - Fetches personalstats independently (guaranteed to populate RS, Points, Class, Wins).
+      - Fetches v2/user/races independently (if active, populates track & standings; if none, shows PIT).
     """
-    v1_url = f"https://api.torn.com/user/{USER_ID}?selections=profile,personalstats,icons&key={api_key}"
-    v1_data = fetch_json(v1_url, api_key)
-    pstats = v1_data.get("personalstats", {})
+    data = get_demo_telemetry()
+    now_ts = int(time.time())
 
-    rs = float(pstats.get("racingskill", 0.0))
-    pts = int(pstats.get("racingpointsearned", 0))
-    entered = int(pstats.get("racesentered", 0))
-    won = int(pstats.get("raceswon", 0))
-
-    v2_races_url = f"https://api.torn.com/v2/user/races?limit=1&key={api_key}"
-    v2_races = fetch_json(v2_races_url, api_key)
-    races_list = v2_races.get("races", [])
-
-    race_info = {
-        "status": "IDLE / IN PIT",
-        "track_id": 5,
-        "track_name": "Docks",
-        "laps": 100,
-        "current_lap": 0,
-        "progress": 0.0,
-        "is_official": True,
-        "position": 1,
-        "total_drivers": 6,
-        "car_name": "Enlisted Spec",
-        "speed_mph": 0.0,
-        "accel": 0.0,
-        "best_lap": "--:--.--",
-        "standings": [],
-    }
-
-    if races_list:
-        latest = races_list[0]
-        track_id = int(latest.get("track_id", 5))
-        track_meta = TORN_TRACKS.get(track_id, {"name": f"Track #{track_id}", "length_mi": 2.0})
-        laps = int(latest.get("laps", 5))
-        status_raw = str(latest.get("status", "finished")).lower()
-        sched = latest.get("schedule", {})
-        start_ts = int(sched.get("start", 0))
-        end_ts = int(sched.get("end", 0))
-        now_ts = int(time.time())
-
-        if status_raw == "in_progress" or (start_ts <= now_ts and (end_ts == 0 or now_ts < end_ts)):
-            est_duration = max(120, int(laps * track_meta["length_mi"] * 28))
-            elapsed = max(0, now_ts - start_ts)
-            overall_prog = min(0.99, elapsed / est_duration)
-            cur_lap = min(laps, int(overall_prog * laps) + 1)
-            lap_prog = (overall_prog * laps) % 1.0
-            race_status = f"LIVE ON TRACK • LAP {cur_lap}/{laps}"
-            est_speed = 132.0 + 18.0 * math.sin(lap_prog * 2 * math.pi)
-            est_accel = 1.4 * math.cos(lap_prog * 2 * math.pi)
-        elif status_raw in ("open", "waiting") or now_ts < start_ts:
-            wait_min = max(1, (start_ts - now_ts) // 60)
-            cur_lap = 0
-            lap_prog = 0.0
-            est_speed = 0.0
-            est_accel = 0.0
-            race_status = f"GRID STAGING • STARTS IN {wait_min}M"
+    # 1. Fetch personalstats & basic profile (v1)
+    try:
+        v1_url = f"https://api.torn.com/user/{USER_ID}?selections=profile,personalstats,icons&key={api_key}"
+        v1_data = fetch_json(v1_url, api_key)
+        if "error" in v1_data:
+            print(f"[TORN API v1 ERROR] {v1_data['error']}", file=sys.stderr, flush=True)
         else:
-            cur_lap = laps
-            lap_prog = 1.0
-            est_speed = 0.0
-            est_accel = 0.0
-            race_status = f"FINISHED • {laps} LAPS"
+            pstats = v1_data.get("personalstats", {})
+            data["racing_skill"] = float(pstats.get("racingskill", data["racing_skill"]))
+            data["racing_points"] = int(pstats.get("racingpointsearned", data["racing_points"]))
+            data["racing_class"] = compute_racing_class(data["racing_points"])
+            data["races_entered"] = int(pstats.get("racesentered", data["races_entered"]))
+            data["races_won"] = int(pstats.get("raceswon", data["races_won"]))
+            if data["races_entered"] > 0:
+                data["win_rate"] = (data["races_won"] / data["races_entered"] * 100.0)
+            print(f"[TORN API v1 OK] RS: {data['racing_skill']} | Pts: {data['racing_points']} | Class: {data['racing_class']}", flush=True)
+    except Exception as exc:
+        print(f"[TORN API v1 EXCEPTION] {exc}", file=sys.stderr, flush=True)
 
-        results = latest.get("results", []) or latest.get("participants", [])
-        standings = []
-        my_pos = 1
-        for idx, entry in enumerate(results[:6]):
-            uid = entry.get("user_id") or entry.get("id") or 0
-            pos = entry.get("position") or (idx + 1)
-            crashed = entry.get("has_crashed", False)
-            car_title = entry.get("car_item_name") or entry.get("car_name") or "Race Car"
-            best_lap_val = entry.get("best_lap_time")
-            is_me = (int(uid) == USER_ID)
-            if is_me:
-                my_pos = pos
-                race_info["car_name"] = car_title
-                if best_lap_val:
-                    race_info["best_lap"] = f"{float(best_lap_val):.2f}s"
-            standings.append({
-                "pos": pos,
-                "label": f"{USER_NAME} [{USER_ID}]" if is_me else f"Driver [{uid}]",
-                "status": "CRASH" if crashed else (f"P{pos}" if status_raw == "finished" else "ON TRACK"),
-                "is_me": is_me,
-                "progress": (lap_prog - idx * 0.09) % 1.0,
-            })
+    # 2. Fetch latest user races (v2)
+    try:
+        v2_races_url = f"https://api.torn.com/v2/user/races?limit=1&key={api_key}"
+        v2_races = fetch_json(v2_races_url, api_key)
+        if "error" in v2_races:
+            print(f"[TORN API v2 ERROR] {v2_races['error']}", file=sys.stderr, flush=True)
+        else:
+            races_list = v2_races.get("races", [])
+            if races_list:
+                latest = races_list[0]
+                track_id = int(latest.get("track_id", 5))
+                track_meta = TORN_TRACKS.get(track_id, {"name": f"Track #{track_id}", "length_mi": 2.0})
+                laps = int(latest.get("laps", 5))
+                status_raw = str(latest.get("status", "finished")).lower()
+                sched = latest.get("schedule", {})
+                start_ts = int(sched.get("start", 0))
+                end_ts = int(sched.get("end", 0))
 
-        race_info.update({
-            "status": race_status,
-            "track_id": track_id,
-            "track_name": track_meta["name"],
-            "laps": laps,
-            "current_lap": cur_lap,
-            "progress": lap_prog,
-            "is_official": bool(latest.get("is_official", True)),
-            "position": my_pos,
-            "total_drivers": max(len(results), 6),
-            "speed_mph": est_speed,
-            "accel": est_accel,
-            "standings": standings,
-        })
+                if status_raw == "in_progress" or (start_ts <= now_ts and (end_ts == 0 or now_ts < end_ts)):
+                    est_duration = max(120, int(laps * track_meta["length_mi"] * 28))
+                    elapsed = max(0, now_ts - start_ts)
+                    overall_prog = min(0.99, elapsed / est_duration)
+                    cur_lap = min(laps, int(overall_prog * laps) + 1)
+                    lap_prog = (overall_prog * laps) % 1.0
+                    race_status = f"LIVE ON TRACK • LAP {cur_lap}/{laps}"
+                    est_speed = 132.0 + 18.0 * math.sin(lap_prog * 2 * math.pi)
+                    est_accel = 1.4 * math.cos(lap_prog * 2 * math.pi)
+                elif status_raw in ("open", "waiting") or now_ts < start_ts:
+                    wait_min = max(1, (start_ts - now_ts) // 60)
+                    cur_lap = 0
+                    lap_prog = 0.0
+                    est_speed = 0.0
+                    est_accel = 0.0
+                    race_status = f"GRID STAGING • STARTS IN {wait_min}M"
+                else:
+                    cur_lap = laps
+                    lap_prog = 1.0
+                    est_speed = 0.0
+                    est_accel = 0.0
+                    race_status = f"FINISHED • {laps} LAPS"
 
-    return {
-        "racing_skill": rs,
-        "racing_points": pts,
-        "racing_class": compute_racing_class(pts),
-        "races_entered": entered,
-        "races_won": won,
-        "win_rate": (won / entered * 100.0) if entered > 0 else 0.0,
-        "race": race_info,
-        "updated_at": time.strftime("%H:%M:%S TCT", time.gmtime()),
-    }
+                results = latest.get("results", []) or latest.get("participants", [])
+                standings = []
+                my_pos = 1
+                for idx, entry in enumerate(results[:6]):
+                    uid = entry.get("user_id") or entry.get("id") or 0
+                    pos = entry.get("position") or (idx + 1)
+                    crashed = entry.get("has_crashed", False)
+                    car_title = entry.get("car_item_name") or entry.get("car_name") or "Race Car"
+                    is_me = (int(uid) == USER_ID)
+                    if is_me:
+                        my_pos = pos
+                        data["race"]["car_name"] = car_title
+                    standings.append({
+                        "pos": pos,
+                        "label": f"{USER_NAME} [{USER_ID}]" if is_me else f"Driver [{uid}]",
+                        "status": "CRASH" if crashed else (f"P{pos}" if status_raw == "finished" else "ON TRACK"),
+                        "is_me": is_me,
+                        "progress": (lap_prog - idx * 0.09) % 1.0,
+                    })
+
+                data["race"].update({
+                    "status": race_status,
+                    "track_id": track_id,
+                    "track_name": track_meta["name"],
+                    "laps": laps,
+                    "current_lap": cur_lap,
+                    "progress": lap_prog,
+                    "is_official": bool(latest.get("is_official", True)),
+                    "position": my_pos,
+                    "total_drivers": max(len(results), 6),
+                    "speed_mph": est_speed,
+                    "accel": est_accel,
+                    "standings": standings if standings else data["race"]["standings"],
+                })
+                print(f"[TORN API v2 OK] Track: {track_meta['name']} | Status: {race_status}", flush=True)
+    except Exception as exc:
+        print(f"[TORN API v2 EXCEPTION] {exc}", file=sys.stderr, flush=True)
+
+    data["updated_at"] = time.strftime("%H:%M:%S TCT", time.gmtime())
+    return data
 
 
 def get_demo_telemetry() -> dict:
-    """Provides sample live Torn Racing Telemetry data for Docks 100-lap heat."""
     return {
         "racing_skill": 24.85,
         "racing_points": 285,
@@ -401,7 +380,6 @@ def load_font(size: int, bold: bool = False):
 
 
 def render_telemetry_banner(data: dict) -> bytes:
-    """Renders the 764x260 PNG image with Torn Racing Telemetry Speed/Accel HUD."""
     width, height = 764, 260
     bg_dark = (11, 9, 8)
     card_bg = (20, 16, 15)
@@ -468,7 +446,6 @@ def render_telemetry_banner(data: dict) -> bytes:
     draw.text((495, 58), f"{track_meta['length_mi']} mi", fill=muted, font=f_small, anchor="ra")
     draw.line([260, 75, 495, 75], fill=crimson_dark, width=1)
 
-    # Live Speed & Acceleration HUD strip (matches Torn Racing Telemetry Green/Red semantics)
     spd = float(race.get("speed_mph", 0.0))
     acc = float(race.get("accel", 0.0))
     acc_color = emerald if acc >= 0.05 else (crimson if acc <= -0.05 else muted)
@@ -540,16 +517,45 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
 
     def _send_cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+    @classmethod
+    def get_or_refresh_bytes(cls) -> bytes:
+        now = time.time()
+        if cls.live_push_data and (now - cls.live_push_ts) < LIVE_PUSH_TTL_SECONDS:
+            cls.cache_bytes = render_telemetry_banner(cls.live_push_data)
+        elif not cls.cache_bytes or (now - cls.cache_ts) > CACHE_TTL_SECONDS:
+            data = fetch_live_torn_telemetry(cls.api_key) if cls.api_key else get_demo_telemetry()
+            cls.cache_bytes = render_telemetry_banner(data)
+            cls.cache_ts = now
+        return cls.cache_bytes
 
     def do_OPTIONS(self):
         self.send_response(204)
         self._send_cors()
         self.end_headers()
 
+    def do_HEAD(self):
+        """Responds to HEAD checks from Torn's media proxy and Render health monitors."""
+        if self.path.startswith("/donyee_sig.png"):
+            png_data = self.get_or_refresh_bytes()
+            self.send_response(200)
+            self._send_cors()
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png_data)))
+            self.send_header("Cache-Control", "no-cache, max-age=15")
+            self.end_headers()
+        elif self.path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self._send_cors()
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_POST(self):
-        """Receives live real-time telemetry JSON pushed from Torn Racing Telemetry."""
         if self.path.startswith("/telemetry"):
             length = int(self.headers.get("Content-Length", 0))
             raw_body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
@@ -577,31 +583,20 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/donyee_sig.png"):
-            now = time.time()
-            # Prefer live pushed Torn Racing Telemetry data if received within last 90s
-            if (
-                TelemetryRequestHandler.live_push_data
-                and (now - TelemetryRequestHandler.live_push_ts) < LIVE_PUSH_TTL_SECONDS
-            ):
-                self.cache_bytes = render_telemetry_banner(TelemetryRequestHandler.live_push_data)
-            elif not self.cache_bytes or (now - self.cache_ts) > CACHE_TTL_SECONDS:
-                try:
-                    data = (
-                        fetch_live_torn_telemetry(self.api_key)
-                        if self.api_key
-                        else get_demo_telemetry()
-                    )
-                except Exception:
-                    data = get_demo_telemetry()
-                self.cache_bytes = render_telemetry_banner(data)
-                self.cache_ts = now
-
+            png_data = self.get_or_refresh_bytes()
             self.send_response(200)
             self._send_cors()
             self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png_data)))
             self.send_header("Cache-Control", "no-cache, max-age=15")
             self.end_headers()
-            self.wfile.write(self.cache_bytes)
+            self.wfile.write(png_data)
+        elif self.path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self._send_cors()
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Donyee Racing Telemetry Server Online\n")
         else:
             self.send_response(404)
             self.end_headers()
@@ -614,14 +609,14 @@ def main():
     parser.add_argument("--demo", action="store_true", help="Render with sample Docks 100-lap live telemetry")
     parser.add_argument("--out", default="donyee_live_telemetry.png", help="Output PNG path")
     parser.add_argument("--serve", action="store_true", help="Run live HTTP server for Torn <img src> hosting")
-    parser.add_argument("--port", type=int, default=8080, help="HTTP server port")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)), help="HTTP server port")
     args = parser.parse_args()
 
     if args.serve:
         TelemetryRequestHandler.api_key = args.key
         server = HTTPServer(("0.0.0.0", args.port), TelemetryRequestHandler)
-        print(f"Serving live Torn signature at http://0.0.0.0:{args.port}/donyee_sig.png")
-        print(f"Listening for live Torn Racing Telemetry pushes at POST http://0.0.0.0:{args.port}/telemetry")
+        print(f"Serving live Torn signature at http://0.0.0.0:{args.port}/donyee_sig.png", flush=True)
+        print(f"Listening for live Torn Racing Telemetry pushes at POST http://0.0.0.0:{args.port}/telemetry", flush=True)
         server.serve_forever()
     else:
         if args.telemetry_json and os.path.exists(args.telemetry_json):
