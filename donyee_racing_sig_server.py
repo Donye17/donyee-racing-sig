@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
 """
-Donyee [4498891] — Torn City Live Racing & Bazaar Signature Server (v3.0)
+Donyee [4498891] — Torn City Live Racing & Bazaar Signature Server (v3.1)
 =========================================================================
-Serves TWO live, auto-updating PNG signature banners from a single Render instance:
-  1. Racing Telemetry HUD:  GET /donyee_sig.png     (Diagnostics: GET /debug)
-  2. Live Bazaar HUD:       GET /donyee_bazaar.png  (Diagnostics: GET /debug-bazaar)
-
-What's New in v3.0 (Live Bazaar Inventory, Market Price Delta & Top Buyers):
-  - Real-Time Bazaar Inventory (`GET /user/4498891?selections=bazaar`):
-    Reads every item currently listed in Donyee's Bazaar (`name`, `quantity`,
-    `price`, and Torn's official `market_price`), calculates exact % above/below
-    Market Value (e.g., `-1.8% MV`, `AT MV`, `+1.2% MV`), plus total stock value
-    vs. total market value.
-  - Real-Time Lifetime Merchant Stats (`GET /user/?selections=personalstats`):
-    Reads real `bazaarprofit` (lifetime sales revenue), `bazaarsales` (total
-    items sold), and `bazaarcustomers` (total customers).
-  - Real-Time Top Buyers Leaderboard (`GET /user/?selections=events` & `log`):
-    Parses real Bazaar sale events ("X bought Y x Item from your bazaar for $Z")
-    and Bazaar sale logs (log type 1225 / category Bazaars), deduplicates by
-    event/log ID into a persistent ledger (`bazaar_buyers_ledger.json`), and
-    ranks Top Buyers by cumulative $ spent and items purchased.
-  - Browser Live Push Support (`POST /bazaar-telemetry` & `POST /telemetry`):
-    Accepts real-time JSON pushes from the companion Tampermonkey script for
-    both Racing waiting lobbies and Bazaar inventory/buyer updates.
+Serves TWO live, auto-updating signature banners from a single Render instance:
+  1. Racing Telemetry HUD:  GET /donyee_sig.png
+  2. Live Bazaar HUD:       GET /donyee_bazaar.gif  (or GET /donyee_bazaar.png)
+                            - Animated scrolling inventory ticker (cycles through
+                              every item in stock, sorted by best % below MV first)
+                            - Zero private networth/revenue mug-bait
+                            - "★ FAVORITE THIS BAZAAR" + "♛ WEEKLY TOP BUYER WINS A PRIZE"
+                              callout panel
+                            - Real-time Weekly, Monthly & All-Time Top Buyers leaderboards
 """
 
 import argparse
@@ -42,7 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 USER_ID = 4498891
 USER_NAME = "DONYEE"
 CACHE_TTL_SECONDS = 15
-LIVE_PUSH_TTL_SECONDS = 900  # Keep live waiting/racing push active for up to 15 mins
+LIVE_PUSH_TTL_SECONDS = 900
 BAZAAR_LEDGER_PATH = os.environ.get("BAZAAR_LEDGER_PATH", "bazaar_buyers_ledger.json")
 
 # Official Torn Wiki Track Lengths (by lowercase track name)
@@ -65,7 +53,6 @@ TRACK_LENGTH_BY_NAME = {
     "convict": 1.64,
 }
 
-# Track ID -> Name table (auto-updated from GET /v2/racing/tracks)
 TORN_TRACKS = {
     1: {"name": "Uptown", "length_mi": 2.25},
     2: {"name": "Withdrawal", "length_mi": 3.40},
@@ -90,10 +77,12 @@ TRACKS_LOADED_FROM_API = False
 DRIVER_NAME_CACHE = {USER_ID: USER_NAME}
 CAR_NAME_CACHE = {}
 
-# Persistent in-memory + disk ledger for real Bazaar buyers
+# Persistent ledger for real Bazaar buyers with timestamped transactions
+# Supports Weekly (7d), Monthly (30d), and All-Time rankings
 BAZAAR_BUYERS_LEDGER = {
     "seen_tx_ids": {},   # tx_id -> timestamp
-    "buyers": {},        # key (name_lower or uid) -> {"name": str, "uid": int, "spent": int, "items": int, "tx_count": int, "last_ts": int}
+    "transactions": [],  # list of {"tx_id", "buyer_key", "name", "uid", "qty", "total", "ts"}
+    "buyers": {},        # legacy/all-time fallback map
 }
 
 
@@ -103,8 +92,22 @@ def load_bazaar_ledger():
         try:
             with open(BAZAAR_LEDGER_PATH, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-                if isinstance(loaded, dict) and "buyers" in loaded:
-                    BAZAAR_BUYERS_LEDGER = loaded
+                if isinstance(loaded, dict):
+                    BAZAAR_BUYERS_LEDGER["seen_tx_ids"] = loaded.get("seen_tx_ids", {})
+                    BAZAAR_BUYERS_LEDGER["transactions"] = loaded.get("transactions", [])
+                    BAZAAR_BUYERS_LEDGER["buyers"] = loaded.get("buyers", {})
+                    if not BAZAAR_BUYERS_LEDGER["transactions"] and BAZAAR_BUYERS_LEDGER["buyers"]:
+                        for bkey, bval in BAZAAR_BUYERS_LEDGER["buyers"].items():
+                            if isinstance(bval, dict) and int(bval.get("spent") or 0) > 0:
+                                BAZAAR_BUYERS_LEDGER["transactions"].append({
+                                    "tx_id": f"migrated_{bkey}",
+                                    "buyer_key": bkey,
+                                    "name": str(bval.get("name") or "Buyer"),
+                                    "uid": int(bval.get("uid") or 0),
+                                    "qty": int(bval.get("items") or 1),
+                                    "total": int(bval.get("spent") or 0),
+                                    "ts": int(bval.get("last_ts") or time.time()),
+                                })
         except Exception:
             pass
 
@@ -119,7 +122,6 @@ def save_bazaar_ledger():
 
 load_bazaar_ledger()
 
-# 2D Circuit Polygons (normalized 0.0..1.0) keyed by lowercase track name
 TRACK_SHAPES = {
     "commerce": [
         (0.18, 0.28), (0.34, 0.14), (0.58, 0.36), (0.86, 0.68),
@@ -230,8 +232,8 @@ def format_money(val: float, compact: bool = False) -> str:
             return f"{sign}${a / 1_000_000_000:.2f}B"
         if a >= 1_000_000:
             return f"{sign}${a / 1_000_000:.2f}M"
-        if a >= 10_000:
-            return f"{sign}${a / 1_000:.1f}K"
+        if a >= 100_000:
+            return f"{sign}${a / 1_000:.0f}K"
     return f"{sign}${int(round(a)):,}"
 
 
@@ -412,7 +414,6 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
 
     ensure_tracks_and_cars_loaded(api_key)
 
-    # 1. Fetch personalstats
     try:
         v1_url = f"https://api.torn.com/user/?selections=personalstats&key={api_key}"
         v1_data = fetch_json(v1_url, api_key)
@@ -431,7 +432,6 @@ def fetch_live_torn_telemetry(api_key: str) -> dict:
     except Exception as exc:
         debug_info["v1_exception"] = str(exc)
 
-    # 2. Fetch user races (/v2/user/races) + lobby races (/v2/racing/races)
     races_by_id = {}
     for url_variant in (
         f"https://api.torn.com/v2/user/races?sort=DESC&limit=20&key={api_key}",
@@ -766,7 +766,7 @@ def get_demo_telemetry() -> dict:
 
 
 # ==============================================================================
-# LIVE BAZAAR INVENTORY, MARKET VALUE & TOP BUYERS ENGINE (v3.0)
+# LIVE BAZAAR ENGINE v3.1 (SCROLLING DEALS + WEEKLY/MONTHLY/ALL-TIME BUYERS)
 # ==============================================================================
 
 EVENT_BUY_RE = re.compile(
@@ -778,16 +778,28 @@ TAG_RE = re.compile(r"<[^>]+>")
 
 
 def record_bazaar_sale(tx_id: str, buyer_name: str, buyer_uid: int, qty: int, total_price: int, ts: int):
-    """Records a unique Bazaar sale into the persistent Top Buyers ledger."""
+    """Records a unique Bazaar sale with its timestamp for Weekly, Monthly & All-Time leaderboards."""
     if not tx_id or total_price <= 0:
         return
     tx_key = str(tx_id)
     if tx_key in BAZAAR_BUYERS_LEDGER["seen_tx_ids"]:
         return
 
-    BAZAAR_BUYERS_LEDGER["seen_tx_ids"][tx_key] = ts
+    now_ts = int(ts or time.time())
+    BAZAAR_BUYERS_LEDGER["seen_tx_ids"][tx_key] = now_ts
     clean_name = str(buyer_name or "").strip() or (f"Player [{buyer_uid}]" if buyer_uid else "Anonymous")
     buyer_key = str(buyer_uid) if buyer_uid and buyer_uid > 0 else clean_name.lower()
+
+    tx_list = BAZAAR_BUYERS_LEDGER.setdefault("transactions", [])
+    tx_list.append({
+        "tx_id": tx_key,
+        "buyer_key": buyer_key,
+        "name": clean_name,
+        "uid": int(buyer_uid or 0),
+        "qty": max(1, int(qty)),
+        "total": int(total_price),
+        "ts": now_ts,
+    })
 
     entry = BAZAAR_BUYERS_LEDGER["buyers"].get(
         buyer_key,
@@ -800,28 +812,44 @@ def record_bazaar_sale(tx_id: str, buyer_name: str, buyer_uid: int, qty: int, to
     entry["spent"] = int(entry.get("spent", 0)) + int(total_price)
     entry["items"] = int(entry.get("items", 0)) + max(1, int(qty))
     entry["tx_count"] = int(entry.get("tx_count", 0)) + 1
-    entry["last_ts"] = max(int(entry.get("last_ts", 0)), int(ts or time.time()))
+    entry["last_ts"] = max(int(entry.get("last_ts", 0)), now_ts)
     BAZAAR_BUYERS_LEDGER["buyers"][buyer_key] = entry
 
 
-def get_top_buyers_list(limit: int = 6) -> list:
-    buyers = list(BAZAAR_BUYERS_LEDGER.get("buyers", {}).values())
-    buyers.sort(key=lambda b: (int(b.get("spent", 0)), int(b.get("items", 0)), int(b.get("last_ts", 0))), reverse=True)
-    out = []
-    for idx, b in enumerate(buyers[:limit]):
-        out.append({
+def get_top_buyers_by_window(max_age_seconds: int = None, limit: int = 5) -> list:
+    """Computes Top Buyers for Weekly (7d), Monthly (30d), or All-Time (None)."""
+    now_ts = int(time.time())
+    cutoff = (now_ts - max_age_seconds) if max_age_seconds else 0
+    agg = {}
+
+    tx_list = BAZAAR_BUYERS_LEDGER.get("transactions") or []
+    for tx in tx_list:
+        tx_ts = int(tx.get("ts") or 0)
+        if cutoff > 0 and tx_ts < cutoff:
+            continue
+        bkey = str(tx.get("buyer_key") or tx.get("name", "").lower())
+        cur = agg.get(bkey, {"name": tx.get("name", "Buyer"), "uid": int(tx.get("uid") or 0), "spent": 0, "items": 0, "last_ts": 0})
+        if tx.get("name") and not str(tx.get("name")).startswith("Player ["):
+            cur["name"] = str(tx["name"])
+        cur["spent"] += int(tx.get("total") or 0)
+        cur["items"] += int(tx.get("qty") or 1)
+        cur["last_ts"] = max(cur["last_ts"], tx_ts)
+        agg[bkey] = cur
+
+    ranked = sorted(agg.values(), key=lambda b: (b["spent"], b["items"], b["last_ts"]), reverse=True)
+    return [
+        {
             "rank": idx + 1,
-            "name": str(b.get("name") or "Unknown"),
-            "uid": int(b.get("uid") or 0),
-            "spent": int(b.get("spent") or 0),
-            "items": int(b.get("items") or 0),
-            "tx_count": int(b.get("tx_count") or 1),
-        })
-    return out
+            "name": str(b["name"]),
+            "uid": int(b["uid"]),
+            "spent": int(b["spent"]),
+            "items": int(b["items"]),
+        }
+        for idx, b in enumerate(ranked[:limit])
+    ]
 
 
 def parse_events_for_bazaar_buyers(events_obj, api_key: str = "") -> int:
-    """Extracts Bazaar purchases from Torn v1/v2 `events` payload."""
     added_before = len(BAZAAR_BUYERS_LEDGER["seen_tx_ids"])
     events_iter = []
     if isinstance(events_obj, dict):
@@ -858,7 +886,6 @@ def parse_events_for_bazaar_buyers(events_obj, api_key: str = "") -> int:
 
 
 def parse_logs_for_bazaar_buyers(log_obj, api_key: str = "") -> int:
-    """Extracts Bazaar sales from Torn `user?selections=log` payload (log type 1225 / category Bazaars)."""
     added_before = len(BAZAAR_BUYERS_LEDGER["seen_tx_ids"])
     logs_iter = []
     if isinstance(log_obj, dict):
@@ -892,27 +919,6 @@ def parse_logs_for_bazaar_buyers(log_obj, api_key: str = "") -> int:
     return added_after - added_before
 
 
-def get_empty_bazaar_data() -> dict:
-    return {
-        "is_open": False,
-        "status_banner": "AWAITING BAZAAR SYNC",
-        "total_skus": 0,
-        "total_units": 0,
-        "total_ask_value": 0,
-        "total_market_value": 0,
-        "overall_vs_mv_pct": 0.0,
-        "lifetime_revenue": 0,
-        "lifetime_sales": 0,
-        "lifetime_customers": 0,
-        "inventory": [],
-        "top_buyers": get_top_buyers_list(6),
-        "needs_bazaar_perm": False,
-        "needs_events_perm": False,
-        "debug": {},
-        "updated_at": time.strftime("%H:%M:%S TCT", time.gmtime()),
-    }
-
-
 def enrich_inventory_item(raw_item: dict) -> dict:
     item_id = int(raw_item.get("ID") or raw_item.get("id") or 0)
     name = str(raw_item.get("name") or f"Item #{item_id}").strip()
@@ -936,6 +942,48 @@ def enrich_inventory_item(raw_item: dict) -> dict:
     }
 
 
+def sort_inventory_by_best_deals(items: list) -> list:
+    """Sorts items so the biggest % discounts below Market Value appear first."""
+    return sorted(items, key=lambda x: (round(float(x.get("diff_pct") or 0.0), 2), -int(x.get("quantity") or 0)))
+
+
+def compute_bazaar_headline_stats(items: list) -> tuple:
+    """Computes shopper-friendly discount stats (ignoring outlier museum/storage items)."""
+    if not items:
+        return 0, 0.0, "○ BAZAAR CLOSED / RESTOCKING SHELVES"
+    total_skus = len(items)
+    total_units = sum(int(x.get("quantity") or 0) for x in items)
+    deals = [x for x in items if float(x.get("diff_pct") or 0.0) < -0.05]
+    best_disc = min(float(x.get("diff_pct") or 0.0) for x in items)
+    if deals:
+        banner = f"● OPEN • {total_skus} SKUs ({total_units:,} ITEMS) • UP TO {abs(best_disc):.1f}% OFF MV"
+    else:
+        sign = "+" if best_disc > 0 else ""
+        banner = f"● OPEN • {total_skus} SKUs ({total_units:,} ITEMS) • {sign}{best_disc:.1f}% VS MV"
+    return len(deals), best_disc, banner
+
+
+def get_empty_bazaar_data() -> dict:
+    return {
+        "is_open": False,
+        "status_banner": "AWAITING BAZAAR SYNC",
+        "total_skus": 0,
+        "total_units": 0,
+        "deals_count": 0,
+        "best_discount_pct": 0.0,
+        "lifetime_sales": 0,
+        "lifetime_customers": 0,
+        "inventory": [],
+        "buyers_weekly": get_top_buyers_by_window(7 * 86400, 5),
+        "buyers_monthly": get_top_buyers_by_window(30 * 86400, 5),
+        "buyers_alltime": get_top_buyers_by_window(None, 5),
+        "needs_bazaar_perm": False,
+        "needs_events_perm": False,
+        "debug": {},
+        "updated_at": time.strftime("%H:%M:%S TCT", time.gmtime()),
+    }
+
+
 def fetch_live_bazaar_data(api_key: str) -> dict:
     data = get_empty_bazaar_data()
     now_ts = int(time.time())
@@ -944,25 +992,17 @@ def fetch_live_bazaar_data(api_key: str) -> dict:
     if not api_key:
         return get_demo_bazaar_data()
 
-    # 1. Fetch personalstats (works immediately with existing Custom Racing key!)
+    # 1. Fetch personalstats (only public customer/sales count, no private revenue displayed)
     try:
         ps_resp = fetch_json(f"https://api.torn.com/user/?selections=personalstats&key={api_key}", api_key)
         if "error" not in ps_resp:
             parsed_ps = extract_personalstats(ps_resp)
             data["lifetime_customers"] = parsed_ps.get("bazaar_customers", 0)
             data["lifetime_sales"] = parsed_ps.get("bazaar_sales", 0)
-            data["lifetime_revenue"] = parsed_ps.get("bazaar_profit", 0)
-            debug_info["personalstats_ok"] = {
-                "bazaarcustomers": data["lifetime_customers"],
-                "bazaarsales": data["lifetime_sales"],
-                "bazaarprofit": data["lifetime_revenue"],
-            }
-        else:
-            debug_info["personalstats_error"] = ps_resp["error"]
     except Exception as exc:
         debug_info["personalstats_exception"] = str(exc)
 
-    # 2. Fetch live Bazaar inventory (`user/4498891?selections=bazaar` or `user/?selections=bazaar`)
+    # 2. Fetch live Bazaar inventory
     bazaar_raw_list = None
     bazaar_open_flag = None
     for b_url in (
@@ -986,19 +1026,17 @@ def fetch_live_bazaar_data(api_key: str) -> dict:
 
     if isinstance(bazaar_raw_list, list):
         items = [enrich_inventory_item(it) for it in bazaar_raw_list if isinstance(it, dict) and int(it.get("quantity") or 0) > 0]
-        items.sort(key=lambda x: (x["total_ask"], x["quantity"]), reverse=True)
+        items = sort_inventory_by_best_deals(items)
         data["inventory"] = items
         data["total_skus"] = len(items)
         data["total_units"] = sum(x["quantity"] for x in items)
-        data["total_ask_value"] = sum(x["total_ask"] for x in items)
-        data["total_market_value"] = sum(x["total_mv"] for x in items)
-        if data["total_market_value"] > 0:
-            data["overall_vs_mv_pct"] = (
-                (data["total_ask_value"] - data["total_market_value"]) / data["total_market_value"]
-            ) * 100.0
+        deals_cnt, best_disc, banner = compute_bazaar_headline_stats(items)
+        data["deals_count"] = deals_cnt
+        data["best_discount_pct"] = best_disc
+        data["status_banner"] = banner
         data["is_open"] = bool(bazaar_open_flag) if bazaar_open_flag is not None else (len(items) > 0)
 
-    # 3. Fetch recent Events & Logs to update real-time Top Buyers
+    # 3. Fetch recent Events & Logs to update real-time Weekly / Monthly / All-Time Top Buyers
     for ev_url in (
         f"https://api.torn.com/user/?selections=events&key={api_key}",
         f"https://api.torn.com/v2/user/events?limit=100&key={api_key}",
@@ -1025,18 +1063,12 @@ def fetch_live_bazaar_data(api_key: str) -> dict:
     except Exception:
         pass
 
-    data["top_buyers"] = get_top_buyers_list(6)
+    data["buyers_weekly"] = get_top_buyers_by_window(7 * 86400, 5)
+    data["buyers_monthly"] = get_top_buyers_by_window(30 * 86400, 5)
+    data["buyers_alltime"] = get_top_buyers_by_window(None, 5)
 
     if data["needs_bazaar_perm"] and not data["inventory"]:
         data["status_banner"] = "KEY NEEDS 'BAZAAR' & 'EVENTS' ACCESS"
-    elif data["inventory"]:
-        sign = "+" if data["overall_vs_mv_pct"] > 0 else ""
-        data["status_banner"] = (
-            f"● OPEN • {data['total_skus']} SKUs ({data['total_units']:,} ITEMS) • "
-            f"{sign}{data['overall_vs_mv_pct']:.1f}% MV"
-        )
-    else:
-        data["status_banner"] = "○ BAZAAR CLOSED / RESTOCKING SHELVES"
 
     data["debug"] = debug_info
     data["updated_at"] = time.strftime("%H:%M:%S TCT", time.gmtime())
@@ -1044,21 +1076,18 @@ def fetch_live_bazaar_data(api_key: str) -> dict:
 
 
 def parse_bazaar_push_payload(payload: dict, fallback_data: dict = None) -> dict:
-    """Ingests live Bazaar inventory & buyer events pushed from the browser Tampermonkey script."""
     base = fallback_data or get_empty_bazaar_data()
 
     if isinstance(payload.get("inventory"), list):
         items = [enrich_inventory_item(it) for it in payload["inventory"] if isinstance(it, dict) and int(it.get("quantity") or 0) > 0]
-        items.sort(key=lambda x: (x["total_ask"], x["quantity"]), reverse=True)
+        items = sort_inventory_by_best_deals(items)
         base["inventory"] = items
         base["total_skus"] = len(items)
         base["total_units"] = sum(x["quantity"] for x in items)
-        base["total_ask_value"] = sum(x["total_ask"] for x in items)
-        base["total_market_value"] = sum(x["total_mv"] for x in items)
-        base["overall_vs_mv_pct"] = (
-            ((base["total_ask_value"] - base["total_market_value"]) / base["total_market_value"]) * 100.0
-            if base["total_market_value"] > 0 else 0.0
-        )
+        deals_cnt, best_disc, banner = compute_bazaar_headline_stats(items)
+        base["deals_count"] = deals_cnt
+        base["best_discount_pct"] = best_disc
+        base["status_banner"] = banner
         base["is_open"] = bool(payload.get("is_open", len(items) > 0))
         base["needs_bazaar_perm"] = False
 
@@ -1080,50 +1109,49 @@ def parse_bazaar_push_payload(payload: dict, fallback_data: dict = None) -> dict
         save_bazaar_ledger()
         base["needs_events_perm"] = False
 
-    base["top_buyers"] = get_top_buyers_list(6)
-    if base["inventory"]:
-        sign = "+" if base["overall_vs_mv_pct"] > 0 else ""
-        base["status_banner"] = (
-            f"● OPEN • {base['total_skus']} SKUs ({base['total_units']:,} ITEMS) • "
-            f"{sign}{base['overall_vs_mv_pct']:.1f}% MV"
-        )
-    else:
-        base["status_banner"] = "○ BAZAAR CLOSED / RESTOCKING SHELVES"
+    base["buyers_weekly"] = get_top_buyers_by_window(7 * 86400, 5)
+    base["buyers_monthly"] = get_top_buyers_by_window(30 * 86400, 5)
+    base["buyers_alltime"] = get_top_buyers_by_window(None, 5)
     base["updated_at"] = time.strftime("%H:%M:%S TCT", time.gmtime())
     return base
 
 
 def get_demo_bazaar_data() -> dict:
-    demo_items = [
-        enrich_inventory_item({"ID": 206, "name": "Xanax", "quantity": 24, "price": 828000, "market_price": 842000}),
-        enrich_inventory_item({"ID": 367, "name": "Feathery Hotel Coupon", "quantity": 4, "price": 13150000, "market_price": 13390000}),
-        enrich_inventory_item({"ID": 366, "name": "Erotic DVD", "quantity": 6, "price": 4650000, "market_price": 4725000}),
-        enrich_inventory_item({"ID": 530, "name": "Can of Munster", "quantity": 18, "price": 1890000, "market_price": 1935000}),
-        enrich_inventory_item({"ID": 258, "name": "Jaguar Plushie", "quantity": 45, "price": 17200, "market_price": 17500}),
-        enrich_inventory_item({"ID": 260, "name": "Peony", "quantity": 30, "price": 68500, "market_price": 69800}),
+    # Mirrors Donyee's actual live screenshot items!
+    raw_items = [
+        {"ID": 1, "name": "Jacket", "quantity": 1, "price": 258, "market_price": 287},
+        {"ID": 2, "name": "Insulin", "quantity": 8, "price": 8070, "market_price": 8967},
+        {"ID": 3, "name": "Shovel", "quantity": 2, "price": 271, "market_price": 301},
+        {"ID": 4, "name": "Candle", "quantity": 1, "price": 367, "market_price": 408},
+        {"ID": 5, "name": "Daffodil", "quantity": 1, "price": 255, "market_price": 283},
+        {"ID": 6, "name": "Umbrella", "quantity": 1, "price": 183, "market_price": 203},
+        {"ID": 7, "name": "Bunch of Flowers", "quantity": 1, "price": 218, "market_price": 242},
+        {"ID": 8, "name": "Bunch of Black Roses", "quantity": 1, "price": 364, "market_price": 404},
+        {"ID": 9, "name": "Meat Hook", "quantity": 1, "price": 9999999, "market_price": 8613263},
     ]
-    total_ask = sum(x["total_ask"] for x in demo_items)
-    total_mv = sum(x["total_mv"] for x in demo_items)
-    diff_pct = ((total_ask - total_mv) / total_mv) * 100.0
+    items = sort_inventory_by_best_deals([enrich_inventory_item(x) for x in raw_items])
+    deals_cnt, best_disc, banner = compute_bazaar_headline_stats(items)
     return {
         "is_open": True,
-        "status_banner": f"● OPEN • {len(demo_items)} SKUs (127 ITEMS) • {diff_pct:.1f}% MV",
-        "total_skus": len(demo_items),
-        "total_units": sum(x["quantity"] for x in demo_items),
-        "total_ask_value": total_ask,
-        "total_market_value": total_mv,
-        "overall_vs_mv_pct": diff_pct,
-        "lifetime_revenue": 482950000,
-        "lifetime_sales": 3420,
-        "lifetime_customers": 418,
-        "inventory": demo_items,
-        "top_buyers": [
-            {"rank": 1, "name": "A-N-T-I-D-O-T-E", "uid": 4548760, "spent": 52600000, "items": 28, "tx_count": 5},
-            {"rank": 2, "name": "Primian", "uid": 2910411, "spent": 34020000, "items": 18, "tx_count": 3},
-            {"rank": 3, "name": "LordFiendish", "uid": 1984220, "spent": 19872000, "items": 24, "tx_count": 4},
-            {"rank": 4, "name": "Ifiron", "uid": 3301920, "spent": 13950000, "items": 3, "tx_count": 2},
-            {"rank": 5, "name": "Medanox", "uid": 3891044, "spent": 9936000, "items": 12, "tx_count": 2},
-            {"rank": 6, "name": "HusbandKitt", "uid": 4102931, "spent": 4968000, "items": 6, "tx_count": 1},
+        "status_banner": banner,
+        "total_skus": len(items),
+        "total_units": sum(x["quantity"] for x in items),
+        "deals_count": deals_cnt,
+        "best_discount_pct": best_disc,
+        "lifetime_sales": 2287,
+        "lifetime_customers": 135,
+        "inventory": items,
+        "buyers_weekly": [
+            {"rank": 1, "name": "CajunRemnant", "uid": 1, "spent": 62300, "items": 7},
+            {"rank": 2, "name": "Talldi", "uid": 2, "spent": 3297, "items": 6},
+        ],
+        "buyers_monthly": [
+            {"rank": 1, "name": "CajunRemnant", "uid": 1, "spent": 62300, "items": 7},
+            {"rank": 2, "name": "Talldi", "uid": 2, "spent": 3297, "items": 6},
+        ],
+        "buyers_alltime": [
+            {"rank": 1, "name": "CajunRemnant", "uid": 1, "spent": 62300, "items": 7},
+            {"rank": 2, "name": "Talldi", "uid": 2, "spent": 3297, "items": 6},
         ],
         "needs_bazaar_perm": False,
         "needs_events_perm": False,
@@ -1175,14 +1203,13 @@ def render_telemetry_banner(data: dict) -> bytes:
     f_small = load_font(10, bold=False)
     f_big_stat = load_font(14, bold=True)
 
-    # Top Header Bar
     draw.rectangle([10, 10, width - 11, 42], fill=(24, 15, 14), outline=crimson_dark)
     draw.text((20, 18), f"♦ {USER_NAME} [{USER_ID}] — LIVE TELEMETRY HUD", fill=gold, font=f_title)
     race = data["race"]
     status_color = emerald if ("LIVE" in race["status"] or "STAGING" in race["status"] or "WAITING" in race["status"]) else gold
     draw.text((width - 20, 19), str(race["status"])[:40], fill=status_color, font=f_bold, anchor="ra")
 
-    # --- COLUMN 1: DRIVER DOSSIER ---
+    # COLUMN 1: DRIVER DOSSIER
     draw.rectangle([10, 50, 240, 248], fill=card_bg, outline=(55, 38, 28))
     draw.text((22, 58), "DRIVER DOSSIER", fill=gold, font=f_sub)
     draw.line([20, 75, 230, 75], fill=crimson_dark, width=1)
@@ -1206,7 +1233,7 @@ def render_telemetry_banner(data: dict) -> bytes:
     draw.text((228, 208), str(race["car_name"])[:20], fill=crimson, font=f_bold, anchor="ra")
     draw.text((22, 229), f"Synced: {data['updated_at']}", fill=(110, 95, 80), font=f_small)
 
-    # --- COLUMN 2: 2D TRACK CIRCUIT MAP & SPEED/ACCEL TELEMETRY ---
+    # COLUMN 2: 2D TRACK CIRCUIT MAP & SPEED/ACCEL TELEMETRY
     draw.rectangle([250, 50, 505, 248], fill=card_bg, outline=(55, 38, 28))
     t_name = str(race.get("track_name") or TORN_TRACKS.get(race["track_id"], {}).get("name", "Track"))
     t_len = float(race.get("track_len_mi") or get_track_length(t_name, 2.0))
@@ -1255,7 +1282,7 @@ def render_telemetry_banner(data: dict) -> bytes:
         pct_txt = f"LAP {race['current_lap']}/{race['laps']} • CUR LAP: {int(race['progress'] * 100)}%"
     draw.text(((bar_x0 + bar_x1) // 2, bar_y0 + 2), pct_txt, fill=ivory, font=f_small, anchor="ma")
 
-    # --- COLUMN 3: RACE POSITIONING / LEADERBOARD ---
+    # COLUMN 3: RACE POSITIONING / LEADERBOARD
     draw.rectangle([515, 50, 753, 248], fill=card_bg, outline=(55, 38, 28))
     draw.text((527, 58), "LIVE GRID / TELEMETRY", fill=gold, font=f_sub)
     draw.line([525, 75, 743, 75], fill=crimson_dark, width=1)
@@ -1279,17 +1306,24 @@ def render_telemetry_banner(data: dict) -> bytes:
     return buf.getvalue()
 
 
-def render_bazaar_banner(data: dict) -> bytes:
-    """Renders the 764x260 Live Bazaar Inventory, Market Valuation & Top Buyers HUD."""
-    width, height = 764, 260
+def render_bazaar_frame(data: dict, scroll_offset: int = 0, active_buyer_tab: int = 0, total_frames: int = 1) -> Image.Image:
+    """
+    Renders a single 764x268 frame of the Bazaar HUD:
+      - Column 1 (x: 10..226): ★ FAVORITE THIS BAZAAR & ♛ WEEKLY PRIZE CALLOUT (zero private stats)
+      - Column 2 (x: 234..512): SCROLLING LIVE DEALS TICKER (with % vs MV pills & scrollbar)
+      - Column 3 (x: 520..753): WEEKLY (PRIZE), MONTHLY & ALL-TIME TOP BUYERS LEADERBOARD
+    """
+    width, height = 764, 268
     bg_dark = (11, 9, 8)
-    card_bg = (20, 16, 15)
-    gold = (212, 175, 55)
-    crimson = (192, 57, 43)
-    crimson_dark = (90, 24, 24)
-    emerald = (46, 204, 113)
-    ivory = (228, 218, 201)
-    muted = (150, 132, 110)
+    card_bg = (19, 15, 14)
+    gold = (218, 180, 60)
+    gold_dim = (145, 118, 45)
+    crimson = (205, 58, 45)
+    crimson_dark = (95, 26, 24)
+    emerald = (46, 214, 118)
+    emerald_bg = (16, 48, 30)
+    ivory = (234, 225, 210)
+    muted = (155, 138, 116)
 
     img = Image.new("RGB", (width, height), bg_dark)
     draw = ImageDraw.Draw(img)
@@ -1300,144 +1334,231 @@ def render_bazaar_banner(data: dict) -> bytes:
             if (x + y) % 12 == 0:
                 draw.rectangle([x, y, x + 2, y + 2], fill=(17, 14, 13))
 
-    draw.rectangle([2, 2, width - 3, height - 3], outline=crimson_dark, width=2)
-    draw.rectangle([6, 6, width - 7, height - 7], outline=(65, 50, 30), width=1)
+    # Outer Syndicate Frame
+    draw.rectangle([1, 1, width - 2, height - 2], outline=crimson_dark, width=2)
+    draw.rectangle([5, 5, width - 6, height - 6], outline=(75, 58, 32), width=1)
 
-    f_title = load_font(15, bold=True)
+    f_title = load_font(14, bold=True)
     f_sub = load_font(11, bold=True)
-    f_body = load_font(11, bold=False)
     f_bold = load_font(11, bold=True)
     f_small = load_font(10, bold=False)
+    f_tiny_b = load_font(9, bold=True)
     f_tiny = load_font(9, bold=False)
 
-    # Top Header Bar
-    draw.rectangle([10, 10, width - 11, 42], fill=(24, 15, 14), outline=crimson_dark)
-    draw.text((20, 18), f"♦ {USER_NAME} [{USER_ID}] — LIVE BAZAAR HUD", fill=gold, font=f_title)
+    # --- TOP HEADER BAR ---
+    draw.rectangle([10, 10, width - 11, 40], fill=(26, 15, 14), outline=crimson_dark)
+    draw.text((18, 17), f"♦ {USER_NAME}'S BAZAAR — LIVE MARKET DEALS", fill=gold, font=f_title)
     banner_str = str(data.get("status_banner") or "")
     banner_col = emerald if "OPEN" in banner_str else (crimson if "KEY NEEDS" in banner_str else gold)
-    draw.text((width - 20, 19), banner_str[:42], fill=banner_col, font=f_bold, anchor="ra")
+    draw.text((width - 18, 18), banner_str[:52], fill=banner_col, font=f_bold, anchor="ra")
 
-    # --- COLUMN 1: MERCHANT DOSSIER (x: 10..218) ---
-    draw.rectangle([10, 50, 218, 248], fill=card_bg, outline=(55, 38, 28))
-    draw.text((20, 58), "MERCHANT DOSSIER", fill=gold, font=f_sub)
-    draw.line([18, 75, 210, 75], fill=crimson_dark, width=1)
+    # ==========================================================================
+    # COLUMN 1: ★ FAVORITE CALLOUT & ♛ WEEKLY TOP BUYER REWARD (x: 10..226)
+    # ==========================================================================
+    draw.rectangle([10, 47, 226, 257], fill=card_bg, outline=(60, 42, 30))
 
-    status_txt = "OPEN (LIVE)" if data.get("is_open") else "RESTOCKING"
-    status_col = emerald if data.get("is_open") else gold
-    draw.text((20, 84), "Status:", fill=muted, font=f_body)
-    draw.text((208, 84), status_txt, fill=status_col, font=f_bold, anchor="ra")
+    # 1A. "★ FAVORITE THIS BAZAAR!" Callout Badge (pulsing gold border on even frames)
+    fav_outline = gold if (scroll_offset % 2 == 0) else crimson
+    draw.rectangle([17, 54, 219, 118], fill=(34, 22, 16), outline=fav_outline, width=2)
+    draw.text((118, 62), "★ FAVORITE THIS BAZAAR ★", fill=gold, font=f_sub, anchor="ma")
+    draw.text((118, 80), "Click the [★ Favorite] star above!", fill=ivory, font=f_tiny_b, anchor="ma")
+    draw.text((118, 94), "Daily restocks @ 10% UNDER MV", fill=emerald, font=f_tiny_b, anchor="ma")
+    draw.text((118, 107), "0% Market Tax • Safe Direct Buy", fill=muted, font=f_tiny, anchor="ma")
 
-    draw.text((20, 106), "Shelf Value:", fill=muted, font=f_body)
-    draw.text((208, 106), format_money(data.get("total_ask_value", 0), compact=True), fill=ivory, font=f_bold, anchor="ra")
+    # 1B. "♛ WEEKLY TOP BUYER REWARD!" Callout Box
+    draw.rectangle([17, 125, 219, 198], fill=(28, 16, 16), outline=crimson_dark, width=1)
+    draw.text((118, 132), "♛ WEEKLY BUYER PRIZE", fill=gold, font=f_sub, anchor="ma")
+    draw.line([25, 147, 211, 147], fill=(70, 30, 25), width=1)
+    draw.text((118, 153), "#1 Weekly Buyer wins a FREE", fill=ivory, font=f_tiny, anchor="ma")
+    draw.text((118, 166), "Weekly Bonus Prize every Sunday!", fill=gold, font=f_tiny_b, anchor="ma")
 
-    draw.text((20, 128), "Market Value:", fill=muted, font=f_body)
-    draw.text((208, 128), format_money(data.get("total_market_value", 0), compact=True), fill=muted, font=f_bold, anchor="ra")
+    wk_leaders = data.get("buyers_weekly") or []
+    cur_leader = wk_leaders[0]["name"][:14] if wk_leaders else "Open Race!"
+    draw.text((118, 182), f"Leader: {cur_leader}", fill=emerald, font=f_tiny_b, anchor="ma")
 
-    diff_pct = float(data.get("overall_vs_mv_pct") or 0.0)
-    diff_sign = "+" if diff_pct > 0 else ""
-    diff_col = emerald if diff_pct <= 0.0 else crimson
-    draw.text((20, 150), "Avg vs. Market:", fill=muted, font=f_body)
-    draw.text((208, 150), f"{diff_sign}{diff_pct:.1f}% MV", fill=diff_col, font=f_bold, anchor="ra")
+    # 1C. Public Shopper Snapshot (Zero private networth/revenue!)
+    deals_cnt = int(data.get("deals_count") or 0)
+    total_skus = int(data.get("total_skus") or 0)
+    best_disc = abs(float(data.get("best_discount_pct") or 0.0))
+    draw.text((18, 206), "Deals Under MV:", fill=muted, font=f_small)
+    draw.text((218, 206), f"{deals_cnt} of {total_skus} SKUs", fill=emerald, font=f_bold, anchor="ra")
 
-    draw.text((20, 172), "Total Revenue:", fill=muted, font=f_body)
-    draw.text((208, 172), format_money(data.get("lifetime_revenue", 0), compact=True), fill=gold, font=f_bold, anchor="ra")
+    draw.text((18, 224), "Top Discount:", fill=muted, font=f_small)
+    draw.text((218, 224), f"Up to {best_disc:.1f}% OFF", fill=gold, font=f_bold, anchor="ra")
 
-    cust = int(data.get("lifetime_customers") or 0)
-    sales = int(data.get("lifetime_sales") or 0)
-    draw.text((20, 194), "Buyers / Sold:", fill=muted, font=f_body)
-    draw.text((208, 194), f"{cust:,} / {sales:,}", fill=ivory, font=f_bold, anchor="ra")
+    draw.text((18, 242), f"Live Sync: {data.get('updated_at', '')}", fill=(105, 92, 78), font=f_tiny)
 
-    draw.text((20, 214), "Zero Tax • Direct Buy", fill=crimson, font=f_tiny)
-    draw.text((20, 229), f"Synced: {data.get('updated_at', '')}", fill=(110, 95, 80), font=f_small)
-
-    # --- COLUMN 2: LIVE INVENTORY & MARKET VALUE DELTA (x: 226..514) ---
-    draw.rectangle([226, 50, 514, 248], fill=card_bg, outline=(55, 38, 28))
-    draw.text((236, 58), "LIVE INVENTORY", fill=gold, font=f_sub)
-    draw.text((438, 59), "ASK PRICE", fill=muted, font=f_tiny, anchor="ra")
-    draw.text((504, 59), "VS MV", fill=muted, font=f_tiny, anchor="ra")
-    draw.line([234, 75, 506, 75], fill=crimson_dark, width=1)
+    # ==========================================================================
+    # COLUMN 2: SCROLLING LIVE INVENTORY vs. MARKET VALUE (x: 234..512)
+    # ==========================================================================
+    draw.rectangle([234, 47, 512, 257], fill=card_bg, outline=(60, 42, 30))
+    draw.text((244, 55), "SCROLLING DEALS", fill=gold, font=f_sub)
+    draw.text((430, 57), "PRICE", fill=muted, font=f_tiny, anchor="ra")
+    draw.text((500, 57), "VS MV", fill=muted, font=f_tiny, anchor="ra")
+    draw.line([242, 72, 504, 72], fill=crimson_dark, width=1)
 
     inv = data.get("inventory") or []
+    visible_rows = 6
     if inv:
-        y_row = 83
-        max_rows = 6
-        for idx, item in enumerate(inv[:max_rows]):
-            if idx % 2 == 0:
-                draw.rectangle([232, y_row - 2, 508, y_row + 19], fill=(26, 20, 18))
+        n_items = len(inv)
+        if n_items <= visible_rows:
+            window_items = [(i, inv[i]) for i in range(n_items)]
+        else:
+            window_items = [((scroll_offset + i) % n_items, inv[(scroll_offset + i) % n_items]) for i in range(visible_rows)]
+
+        y_row = 79
+        for row_i, (orig_idx, item) in enumerate(window_items):
+            row_bg = (27, 21, 19) if row_i % 2 == 0 else (21, 16, 15)
+            draw.rectangle([240, y_row - 1, 496, y_row + 21], fill=row_bg)
+
             qty_str = f"{item['quantity']}x"
             name_str = str(item["name"])[:16]
-            ask_str = format_money(item["price"], compact=(item["price"] >= 10_000_000))
+            ask_str = format_money(item["price"], compact=(item["price"] >= 1_000_000))
             d_pct = float(item.get("diff_pct") or 0.0)
+
+            draw.text((244, y_row + 3), qty_str, fill=gold, font=f_bold)
+            draw.text((278, y_row + 3), name_str, fill=ivory, font=f_small)
+            draw.text((430, y_row + 3), ask_str, fill=ivory, font=f_small, anchor="ra")
+
+            # Draw high-contrast % vs MV pill badge
+            pill_x0, pill_y0, pill_x1, pill_y1 = 436, y_row + 1, 494, y_row + 19
             if abs(d_pct) < 0.05:
-                mv_str = "AT MV"
-                mv_col = gold
+                draw.rectangle([pill_x0, pill_y0, pill_x1, pill_y1], fill=(45, 36, 18), outline=gold_dim)
+                draw.text((465, y_row + 4), "AT MV", fill=gold, font=f_tiny_b, anchor="ma")
             elif d_pct < 0:
-                mv_str = f"{d_pct:.1f}%"
-                mv_col = emerald
+                draw.rectangle([pill_x0, pill_y0, pill_x1, pill_y1], fill=emerald_bg, outline=(35, 130, 75))
+                draw.text((465, y_row + 4), f"▼{abs(d_pct):.1f}%", fill=emerald, font=f_tiny_b, anchor="ma")
             else:
-                mv_str = f"+{d_pct:.1f}%"
-                mv_col = crimson
+                draw.rectangle([pill_x0, pill_y0, pill_x1, pill_y1], fill=(55, 20, 18), outline=crimson_dark)
+                draw.text((465, y_row + 4), f"▲{d_pct:.1f}%", fill=crimson, font=f_tiny_b, anchor="ma")
 
-            draw.text((236, y_row + 2), qty_str, fill=gold, font=f_bold)
-            draw.text((274, y_row + 2), name_str, fill=ivory, font=f_small)
-            draw.text((438, y_row + 2), ask_str, fill=ivory, font=f_small, anchor="ra")
-            draw.text((504, y_row + 2), mv_str, fill=mv_col, font=f_bold, anchor="ra")
-            y_row += 25
-
-        if len(inv) > max_rows:
-            rem_skus = len(inv) - max_rows
-            rem_units = sum(x["quantity"] for x in inv[max_rows:])
-            draw.text(
-                (370, 232),
-                f"+ {rem_skus} more item types in stock ({rem_units:,} units)",
-                fill=muted,
-                font=f_tiny,
-                anchor="ma",
-            )
-    else:
-        if data.get("needs_bazaar_perm"):
-            draw.text((370, 130), "API KEY NEEDS 'BAZAAR' ACCESS", fill=crimson, font=f_bold, anchor="ma")
-            draw.text((370, 152), "Enable 'bazaar' on your Torn API key", fill=ivory, font=f_small, anchor="ma")
-            draw.text((370, 170), "or open your Bazaar with Tampermonkey active", fill=muted, font=f_tiny, anchor="ma")
-        else:
-            draw.text((370, 138), "NO ITEMS CURRENTLY ON SHELF", fill=gold, font=f_bold, anchor="ma")
-            draw.text((370, 160), "Restocking inventory — check back shortly", fill=muted, font=f_small, anchor="ma")
-
-    # --- COLUMN 3: REAL-TIME TOP BUYERS LEADERBOARD (x: 522..753) ---
-    draw.rectangle([522, 50, 753, 248], fill=card_bg, outline=(55, 38, 28))
-    draw.text((532, 58), "TOP BUYERS (LIVE)", fill=gold, font=f_sub)
-    draw.text((743, 59), "TOTAL SPENT", fill=muted, font=f_tiny, anchor="ra")
-    draw.line([530, 75, 745, 75], fill=crimson_dark, width=1)
-
-    buyers = data.get("top_buyers") or []
-    if buyers:
-        y_row = 83
-        for idx, b in enumerate(buyers[:6]):
-            is_top1 = (idx == 0)
-            if is_top1:
-                draw.rectangle([528, y_row - 2, 747, y_row + 20], fill=(55, 20, 18), outline=gold, width=1)
-            rank_col = gold if is_top1 else muted
-            name_col = gold if is_top1 else ivory
-            spent_str = format_money(b["spent"], compact=(b["spent"] >= 1_000_000))
-            items_str = f"({b['items']}x)"
-
-            draw.text((533, y_row + 3), f"#{b['rank']}", fill=rank_col, font=f_bold)
-            draw.text((556, y_row + 3), str(b["name"])[:12], fill=name_col, font=f_small)
-            draw.text((662, y_row + 4), items_str[:7], fill=muted, font=f_tiny, anchor="ra")
-            draw.text((743, y_row + 3), spent_str, fill=emerald, font=f_bold, anchor="ra")
             y_row += 26
-    else:
-        if data.get("needs_events_perm"):
-            draw.text((637, 130), "NEEDS 'EVENTS/LOG' KEY", fill=crimson, font=f_bold, anchor="ma")
-            draw.text((637, 152), "Add 'events' to your Torn API key", fill=ivory, font=f_tiny, anchor="ma")
-            draw.text((637, 168), "to rank real-time Top Buyers", fill=muted, font=f_tiny, anchor="ma")
+
+        # Visual Scrollbar Track on right edge of Column 2 (x: 500..506)
+        sb_x0, sb_y0, sb_x1, sb_y1 = 500, 79, 506, 231
+        draw.rectangle([sb_x0, sb_y0, sb_x1, sb_y1], fill=(14, 11, 10), outline=(45, 32, 24))
+        if n_items > visible_rows:
+            thumb_h = max(20, int((sb_y1 - sb_y0) * (visible_rows / n_items)))
+            max_travel = (sb_y1 - sb_y0) - thumb_h
+            thumb_y = sb_y0 + int((scroll_offset / max(1, n_items - 1)) * max_travel)
+            draw.rectangle([sb_x0 + 1, thumb_y, sb_x1 - 1, thumb_y + thumb_h], fill=gold)
+            footer_txt = f"⟳ Auto-Scrolling Shelf (Item #{scroll_offset + 1} of {n_items} SKUs)"
         else:
-            draw.text((637, 138), "AWAITING FIRST SALE", fill=gold, font=f_bold, anchor="ma")
-            draw.text((637, 160), "Buyers rank automatically on purchase", fill=muted, font=f_tiny, anchor="ma")
+            draw.rectangle([sb_x0 + 1, sb_y0 + 1, sb_x1 - 1, sb_y1 - 1], fill=gold_dim)
+            footer_txt = f"Showing all {n_items} active SKUs on shelf"
+
+        draw.text((370, 240), footer_txt, fill=muted, font=f_tiny, anchor="ma")
+    else:
+        draw.text((373, 140), "RESTOCKING BAZAAR SHELVES", fill=gold, font=f_bold, anchor="ma")
+        draw.text((373, 162), "★ Favorite above to catch the next drop!", fill=emerald, font=f_small, anchor="ma")
+
+    # ==========================================================================
+    # COLUMN 3: TOP BUYERS — WEEKLY (PRIZE), MONTHLY & ALL-TIME (x: 520..753)
+    # ==========================================================================
+    draw.rectangle([520, 47, 753, 257], fill=card_bg, outline=(60, 42, 30))
+    draw.text((530, 55), "TOP BUYERS CLUB", fill=gold, font=f_sub)
+    draw.text((744, 57), "REWARD RACE", fill=emerald, font=f_tiny_b, anchor="ra")
+    draw.line([528, 72, 745, 72], fill=crimson_dark, width=1)
+
+    wk_list = data.get("buyers_weekly") or []
+    mo_list = data.get("buyers_monthly") or []
+    all_list = data.get("buyers_alltime") or []
+
+    # --- TIER 1: ★ THIS WEEK'S PRIZE RACE (7 DAYS) ---
+    draw.rectangle([527, 77, 746, 93], fill=(42, 22, 16), outline=(90, 60, 25))
+    draw.text((533, 80), "★ WEEKLY PRIZE RACE (7D)", fill=gold, font=f_tiny_b)
+    draw.text((741, 80), "WINS GIFT!", fill=emerald, font=f_tiny_b, anchor="ra")
+
+    y_cur = 97
+    if wk_list:
+        for idx, b in enumerate(wk_list[:2]):
+            is_first = (idx == 0)
+            if is_first:
+                draw.rectangle([527, y_cur - 1, 746, y_cur + 18], fill=(55, 22, 18), outline=gold, width=1)
+            r_col = gold if is_first else muted
+            n_col = gold if is_first else ivory
+            badge = "★1ST" if is_first else "#2"
+            draw.text((531, y_cur + 2), badge, fill=r_col, font=f_tiny_b)
+            draw.text((564, y_cur + 2), str(b["name"])[:12], fill=n_col, font=f_small)
+            draw.text((668, y_cur + 3), f"({b['items']}x)", fill=muted, font=f_tiny, anchor="ra")
+            draw.text((742, y_cur + 2), format_money(b["spent"], compact=True), fill=emerald, font=f_bold, anchor="ra")
+            y_cur += 21
+    else:
+        draw.text((636, y_cur + 8), "Buy anything this week to take #1!", fill=ivory, font=f_tiny, anchor="ma")
+        y_cur += 38
+
+    # --- TIER 2: ♦ MONTHLY LEADERS (30 DAYS) ---
+    y_cur = max(y_cur + 2, 141)
+    draw.rectangle([527, y_cur, 746, y_cur + 15], fill=(26, 20, 18), outline=(55, 40, 28))
+    draw.text((533, y_cur + 2), "♦ MONTHLY TOP BUYERS (30D)", fill=gold, font=f_tiny_b)
+    y_cur += 18
+
+    if mo_list:
+        for idx, b in enumerate(mo_list[:2]):
+            r_col = gold if idx == 0 else muted
+            draw.text((531, y_cur + 1), f"#{idx + 1}", fill=r_col, font=f_tiny_b)
+            draw.text((554, y_cur + 1), str(b["name"])[:13], fill=ivory, font=f_small)
+            draw.text((668, y_cur + 2), f"({b['items']}x)", fill=muted, font=f_tiny, anchor="ra")
+            draw.text((742, y_cur + 1), format_money(b["spent"], compact=True), fill=emerald, font=f_bold, anchor="ra")
+            y_cur += 19
+    else:
+        draw.text((636, y_cur + 6), "No monthly sales recorded yet", fill=muted, font=f_tiny, anchor="ma")
+        y_cur += 34
+
+    # --- TIER 3: ♛ ALL-TIME HALL OF FAME ---
+    y_cur = max(y_cur + 2, 199)
+    draw.rectangle([527, y_cur, 746, y_cur + 15], fill=(26, 20, 18), outline=(55, 40, 28))
+    draw.text((533, y_cur + 2), "♛ ALL-TIME HALL OF FAME", fill=gold, font=f_tiny_b)
+    y_cur += 18
+
+    if all_list:
+        for idx, b in enumerate(all_list[:2]):
+            r_col = gold if idx == 0 else muted
+            draw.text((531, y_cur + 1), f"#{idx + 1}", fill=r_col, font=f_tiny_b)
+            draw.text((554, y_cur + 1), str(b["name"])[:13], fill=ivory, font=f_small)
+            draw.text((668, y_cur + 2), f"({b['items']}x)", fill=muted, font=f_tiny, anchor="ra")
+            draw.text((742, y_cur + 1), format_money(b["spent"], compact=True), fill=gold, font=f_bold, anchor="ra")
+            y_cur += 19
+    else:
+        draw.text((636, y_cur + 6), "Awaiting first VIP buyer", fill=muted, font=f_tiny, anchor="ma")
+
+    return img
+
+
+def render_bazaar_banner(data: dict, animated: bool = True) -> tuple:
+    """
+    Returns (bytes, content_type).
+    When animated=True and there are multiple items, produces an animated GIF that
+    smoothly scrolls through every item in the Bazaar inventory!
+    """
+    inv = data.get("inventory") or []
+    n_items = len(inv)
+
+    if not animated or n_items <= 1:
+        frame = render_bazaar_frame(data, scroll_offset=0, total_frames=1)
+        buf = io.BytesIO()
+        frame.save(buf, format="PNG", optimize=True)
+        return buf.getvalue(), "image/png"
+
+    num_frames = n_items if n_items > 6 else 2
+    frames = []
+    for f_idx in range(num_frames):
+        offset = f_idx if n_items > 6 else 0
+        rgb_frame = render_bazaar_frame(data, scroll_offset=offset, active_buyer_tab=f_idx % 3, total_frames=num_frames)
+        p_frame = rgb_frame.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+        frames.append(p_frame)
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=1800,
+        loop=0,
+        optimize=True,
+    )
+    return buf.getvalue(), "image/gif"
 
 
 class TelemetryRequestHandler(BaseHTTPRequestHandler):
@@ -1448,6 +1569,7 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
     live_push_ts = 0.0
 
     bazaar_cache_bytes = None
+    bazaar_cache_ctype = "image/gif"
     bazaar_cache_ts = 0.0
     last_bazaar_data = None
     live_bazaar_push = None
@@ -1474,17 +1596,17 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
         return cls.cache_bytes
 
     @classmethod
-    def get_or_refresh_bazaar_bytes(cls) -> bytes:
+    def get_or_refresh_bazaar_bytes(cls) -> tuple:
         now = time.time()
         active_key = cls.bazaar_api_key or cls.api_key
         if cls.live_bazaar_push and (now - cls.live_bazaar_push_ts) < LIVE_PUSH_TTL_SECONDS:
-            cls.bazaar_cache_bytes = render_bazaar_banner(cls.live_bazaar_push)
+            cls.bazaar_cache_bytes, cls.bazaar_cache_ctype = render_bazaar_banner(cls.live_bazaar_push, animated=True)
         elif not cls.bazaar_cache_bytes or (now - cls.bazaar_cache_ts) > CACHE_TTL_SECONDS:
             data = fetch_live_bazaar_data(active_key) if active_key else get_demo_bazaar_data()
             cls.last_bazaar_data = data
-            cls.bazaar_cache_bytes = render_bazaar_banner(data)
+            cls.bazaar_cache_bytes, cls.bazaar_cache_ctype = render_bazaar_banner(data, animated=True)
             cls.bazaar_cache_ts = now
-        return cls.bazaar_cache_bytes
+        return cls.bazaar_cache_bytes, cls.bazaar_cache_ctype
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1500,12 +1622,12 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(png_data)))
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.end_headers()
-        elif self.path.startswith("/donyee_bazaar.png"):
-            png_data = self.get_or_refresh_bazaar_bytes()
+        elif self.path.startswith("/donyee_bazaar"):
+            img_data, ctype = self.get_or_refresh_bazaar_bytes()
             self.send_response(200)
             self._send_cors()
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(png_data)))
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(img_data)))
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.end_headers()
         elif self.path in ("/", "/health", "/healthz", "/debug", "/debug-bazaar"):
@@ -1557,9 +1679,10 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
                     payload, fallback_data=base_bazaar
                 )
                 TelemetryRequestHandler.live_bazaar_push_ts = time.time()
-                TelemetryRequestHandler.bazaar_cache_bytes = render_bazaar_banner(
-                    TelemetryRequestHandler.live_bazaar_push
-                )
+                (
+                    TelemetryRequestHandler.bazaar_cache_bytes,
+                    TelemetryRequestHandler.bazaar_cache_ctype,
+                ) = render_bazaar_banner(TelemetryRequestHandler.live_bazaar_push, animated=True)
                 TelemetryRequestHandler.bazaar_cache_ts = time.time()
                 self.send_response(200)
                 self._send_cors()
@@ -1585,15 +1708,15 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.end_headers()
             self.wfile.write(png_data)
-        elif self.path.startswith("/donyee_bazaar.png"):
-            png_data = self.get_or_refresh_bazaar_bytes()
+        elif self.path.startswith("/donyee_bazaar"):
+            img_data, ctype = self.get_or_refresh_bazaar_bytes()
             self.send_response(200)
             self._send_cors()
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(png_data)))
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(img_data)))
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.end_headers()
-            self.wfile.write(png_data)
+            self.wfile.write(img_data)
         elif self.path.startswith("/debug-bazaar"):
             self.get_or_refresh_bazaar_bytes()
             debug_payload = {
@@ -1601,7 +1724,7 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
                     self.live_bazaar_push and (time.time() - self.live_bazaar_push_ts) < LIVE_PUSH_TTL_SECONDS
                 ),
                 "last_bazaar_data": self.last_bazaar_data,
-                "ledger_buyers_count": len(BAZAAR_BUYERS_LEDGER.get("buyers", {})),
+                "ledger_transactions_count": len(BAZAAR_BUYERS_LEDGER.get("transactions", [])),
             }
             body = json.dumps(debug_payload, indent=2).encode("utf-8")
             self.send_response(200)
@@ -1629,7 +1752,7 @@ class TelemetryRequestHandler(BaseHTTPRequestHandler):
             self._send_cors()
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"Donyee Racing & Bazaar Telemetry Server v3.0 Online\n")
+            self.wfile.write(b"Donyee Racing & Bazaar Telemetry Server v3.1 Online\n")
         else:
             self.send_response(404)
             self.end_headers()
@@ -1641,8 +1764,9 @@ def main():
     parser.add_argument("--bazaar-key", default=os.environ.get("TORN_BAZAAR_API_KEY", ""), help="Optional separate Bazaar API Key")
     parser.add_argument("--telemetry-json", default="", help="Path to Torn Racing Telemetry Detailed JSON export")
     parser.add_argument("--demo", action="store_true", help="Render with sample telemetry")
-    parser.add_argument("--bazaar", action="store_true", help="Render Bazaar PNG instead of Racing PNG in CLI mode")
-    parser.add_argument("--out", default="donyee_live_telemetry.png", help="Output PNG path")
+    parser.add_argument("--bazaar", action="store_true", help="Render Bazaar banner instead of Racing PNG in CLI mode")
+    parser.add_argument("--static-png", action="store_true", help="Render single PNG frame instead of animated GIF")
+    parser.add_argument("--out", default="donyee_live_telemetry.png", help="Output path")
     parser.add_argument("--serve", action="store_true", help="Run live HTTP server for Torn <img src> hosting")
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8080)), help="HTTP server port")
     args = parser.parse_args()
@@ -1652,13 +1776,13 @@ def main():
         TelemetryRequestHandler.bazaar_api_key = args.bazaar_key or args.key
         server = HTTPServer(("0.0.0.0", args.port), TelemetryRequestHandler)
         print(f"Serving Racing HUD at http://0.0.0.0:{args.port}/donyee_sig.png", flush=True)
-        print(f"Serving Bazaar HUD at http://0.0.0.0:{args.port}/donyee_bazaar.png", flush=True)
+        print(f"Serving Animated Bazaar HUD at http://0.0.0.0:{args.port}/donyee_bazaar.gif", flush=True)
         server.serve_forever()
     else:
         if args.bazaar:
             b_key = args.bazaar_key or args.key
             data = get_demo_bazaar_data() if (args.demo or not b_key) else fetch_live_bazaar_data(b_key)
-            png_bytes = render_bazaar_banner(data)
+            img_bytes, _ = render_bazaar_banner(data, animated=(not args.static_png))
         else:
             if args.telemetry_json and os.path.exists(args.telemetry_json):
                 with open(args.telemetry_json, "r", encoding="utf-8") as f:
@@ -1668,11 +1792,11 @@ def main():
                 data = get_demo_telemetry()
             else:
                 data = fetch_live_torn_telemetry(args.key)
-            png_bytes = render_telemetry_banner(data)
+            img_bytes = render_telemetry_banner(data)
 
         with open(args.out, "wb") as f:
-            f.write(png_bytes)
-        print(f"Saved {len(png_bytes)} bytes to {args.out}")
+            f.write(img_bytes)
+        print(f"Saved {len(img_bytes)} bytes to {args.out}")
 
 
 if __name__ == "__main__":
